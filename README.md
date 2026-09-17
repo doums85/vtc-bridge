@@ -92,4 +92,5 @@ une session Telethon donne un accès complet au compte Telegram associé. Même 
 
 ## Licence
 
-Aucune licence déclarée : tous droits réservés.
+[MIT](LICENSE). Réutilisation libre, y compris commerciale, à condition de conserver la
+mention de copyright et le texte de la licence. Le logiciel est fourni sans garantie.
