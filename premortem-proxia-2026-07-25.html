@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premortem — Lancement de PROXIA</title>
+<style>
+  :root{
+    --bg:#0a0e1a; --panel:#111726; --panel2:#0e1420; --border:#1e2942;
+    --ink:#e8ecf6; --muted:#9aa6c2; --faint:#6b7796;
+    --gold:#f4a621; --red:#ff5a5a; --orange:#ff9f45; --green:#4bd18a; --cyan:#5ec8e0;
+    --c1:#ff5a5a; --c2:#ff8a3d; --c3:#f4c430; --c4:#7ee081; --c5:#5ec8e0; --c6:#7aa2ff; --c7:#c07dff; --c8:#ff6fae;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 700px at 80% -10%,#141d33,transparent),var(--bg);
+    color:var(--ink);font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6;-webkit-font-smoothing:antialiased;}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,monospace;}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 22px;}
+  header.hero{padding:52px 0 26px;border-bottom:1px solid var(--border);}
+  .eyebrow{font-family:ui-monospace,Menlo,monospace;font-size:12px;letter-spacing:.24em;text-transform:uppercase;
+    color:var(--gold);display:inline-flex;gap:10px;align-items:center;}
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--gold);opacity:.6;}
+  h1{font-size:clamp(2rem,5vw,3.1rem);line-height:1.05;letter-spacing:-.03em;margin:16px 0 8px;font-weight:850;}
+  h1 .dead{color:var(--red);}
+  .frame{color:var(--muted);max-width:64ch;font-size:1.05rem;}
+  .meta{margin-top:18px;display:flex;flex-wrap:wrap;gap:8px;font-family:ui-monospace,Menlo,monospace;font-size:12px;}
+  .tag{border:1px solid var(--border);background:var(--panel);border-radius:100px;padding:5px 12px;color:var(--muted);}
+  .tag b{color:var(--ink);}
+
+  section{padding:34px 0;}
+  h2{font-size:1.5rem;letter-spacing:-.02em;margin:0 0 6px;font-weight:800;}
+  h2 .idx{font-family:ui-monospace,Menlo,monospace;color:var(--gold);font-size:1rem;margin-right:10px;}
+  .sub{color:var(--faint);font-size:.92rem;margin:0 0 20px;}
+
+  .synth{display:grid;gap:14px;}
+  .scard{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--border);
+    border-radius:16px;padding:20px 22px;position:relative;overflow:hidden;}
+  .scard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;}
+  .scard.likely::before{background:var(--red);}
+  .scard.dangerous::before{background:var(--orange);}
+  .scard.hidden::before{background:var(--gold);}
+  .scard.revised::before{background:var(--green);}
+  .scard.check::before{background:var(--cyan);}
+  .scard .lbl{font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--faint);margin-bottom:8px;}
+  .scard.likely .lbl{color:var(--red);} .scard.dangerous .lbl{color:var(--orange);}
+  .scard.hidden .lbl{color:var(--gold);} .scard.revised .lbl{color:var(--green);} .scard.check .lbl{color:var(--cyan);}
+  .scard h3{margin:0 0 8px;font-size:1.16rem;letter-spacing:-.01em;}
+  .scard p{margin:0;color:var(--muted);}
+  .scard ul{margin:8px 0 0;padding-left:0;list-style:none;}
+  .scard li{position:relative;padding-left:22px;margin:9px 0;color:var(--muted);}
+  .scard li::before{content:"→";position:absolute;left:0;color:var(--green);font-weight:700;}
+  .scard.check li::before{content:"☐";color:var(--cyan);}
+  .scard li b{color:var(--ink);}
+  .maps{display:inline-block;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--faint);
+    border:1px solid var(--border);border-radius:5px;padding:1px 6px;margin-left:6px;}
+
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;}
+  @media(max-width:760px){.grid{grid-template-columns:1fr;}}
+  .fcard{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px;position:relative;}
+  .fcard .top{display:flex;align-items:flex-start;gap:12px;margin-bottom:12px;}
+  .fnum{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:.9rem;width:30px;height:30px;flex:0 0 30px;
+    display:grid;place-items:center;border-radius:9px;color:#0a0e1a;}
+  .fcard h4{margin:0;font-size:1.06rem;letter-spacing:-.01em;line-height:1.25;}
+  .sev{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+    padding:3px 8px;border-radius:5px;white-space:nowrap;margin-top:3px;display:inline-block;}
+  .sev.max{background:rgba(255,90,90,.15);color:var(--red);}
+  .sev.high{background:rgba(255,159,69,.15);color:var(--orange);}
+  .sev.med{background:rgba(244,196,48,.15);color:var(--c3);}
+  .story{color:var(--muted);font-size:.93rem;margin:0 0 14px;}
+  .kv{border-top:1px solid var(--border);padding-top:12px;margin-top:12px;}
+  .kv .k{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);}
+  .kv p{margin:4px 0 0;font-size:.9rem;color:var(--ink);}
+  .kv.warn p{color:var(--orange);}
+  .kv.warn .k{color:var(--orange);}
+
+  .scope{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 0;}
+  .dot{width:10px;height:10px;border-radius:50%;}
+  footer{border-top:1px solid var(--border);padding:26px 0 60px;color:var(--faint);font-size:.85rem;}
+  .agentsrow{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}
+  .achip{font-family:ui-monospace,Menlo,monospace;font-size:10px;color:var(--muted);border:1px solid var(--border);
+    background:var(--panel2);border-radius:6px;padding:3px 8px;}
+</style>
+</head>
+<body>
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">Premortem · prospective hindsight</span>
+  <h1>Le lancement de PROXIA<br>a <span class="dead">échoué</span>. Voici pourquoi.</h1>
+  <p class="frame">On est le 25 janvier 2027. Six mois après le lancement commercial, PROXIA est mort : aucun chef externe ne renouvelle. Ce rapport remonte le fil — 8 enquêteurs indépendants, un par cause de décès — pour exposer les failles pendant qu'on peut encore changer de cap.</p>
+  <div class="meta">
+    <span class="tag"><b>Objet</b> · SaaS dispatch VTC B2B2C (bot officiel vendu aux chefs)</span>
+    <span class="tag"><b>8</b> causes analysées</span>
+    <span class="tag"><b>Horizon</b> · 6 mois</span>
+  </div>
+</div></header>
+
+<main class="wrap">
+
+<section>
+  <h2><span class="idx">01</span>Synthèse</h2>
+  <p class="sub">Ce que la plupart des gens liront. Le détail par cause est plus bas.</p>
+  <div class="synth">
+
+    <div class="scard likely">
+      <div class="lbl">⚠ La défaillance la plus probable</div>
+      <h3>Le chef ne paie pas — parce qu'il ne possède rien à monétiser</h3>
+      <p>C'est le premier mur, atteint dès l'étape « passage au payant ». La valeur cash tombe chez le <b>chauffeur</b> ; le chef, lui, reçoit une facture (payeur ≠ bénéficiaire). Et surtout : un « groupe VTC » n'est pas un actif captif — les <b>mêmes courses sont repostées dans 10-15 groupes</b>, les chauffeurs suivent 8-12 groupes en parallèle. Le chef ne <i>possède</i> pas de flux, il relaie. Pire, certains chefs vivent de l'apport d'affaires : un dispatch automatique les <b>désintermédie</b> → ils rejettent activement le bot. <span class="maps">causes 2 + 8</span></p>
+    </div>
+
+    <div class="scard dangerous">
+      <div class="lbl">☠ La défaillance la plus dangereuse</div>
+      <h3>Le ban Telegram qui emporte aussi ton gagne-pain de chauffeur</h3>
+      <p>Moins certaine, mais <b>irréversible et existentielle</b>. Le userbot sur ton compte perso + le dispatch automatisé commercial (rafales de DM, réponses en masse) déclenchent l'anti-spam : FloodWait, puis <b>ban du numéro</b>. Tu perds d'un coup les groupes source, les données, la prod — <b>et ton propre accès de chauffeur VTC</b>. À couvrir en priorité même si la proba est moyenne. Juste derrière : un incident RGPD ou de sécurité routière (tapoter une alerte au volant). <span class="maps">causes 1 + 7</span></p>
+    </div>
+
+    <div class="scard hidden">
+      <div class="lbl">🎯 L'hypothèse cachée (le cœur du premortem)</div>
+      <h3>« Il y a un produit ici, et il se transfère aux autres »</h3>
+      <p>L'hypothèse porteuse de tout le lancement, jamais questionnée. Ce qui marche pour <b>toi</b> (N=1) ne survit pas à la mise en produit : (a) la « magie » venait de l'<b>accès total et silencieux d'un compte perso</b>, pas de l'algorithme — le bot officiel conforme exige admin + opt-in position, que chefs et chauffeurs refusent ; (b) ton parseur encode la connaissance intime de <b>tes 11 groupes</b>, pas une compétence générale ; (c) tu es l'<b>unique utilisateur expert</b>. Trois causes indépendantes (3, 4, 5) frappent cette même illusion. Si elle est fausse, la thèse B2B2C s'effondre.</p>
+    </div>
+
+    <div class="scard revised">
+      <div class="lbl">🛠 Le plan révisé</div>
+      <ul>
+        <li><b>Ne construis pas le SaaS. Valide d'abord les 2 hypothèses tueuses (2 semaines).</b> Pitche le produit payant à 10 chefs et tente d'encaisser un <b>acompte de 49 € / une LOI signée</b>. Si &lt; 3/10 mettent de l'argent → la thèse « vendre aux chefs » est morte, pivote. <span class="maps">cause 2/8</span></li>
+        <li><b>Mesure le recoupement des courses</b> entre les groupes que tu vois déjà. Si &gt; 70 % de doublons → le « par groupe » n'a aucune valeur, revois la cible. <span class="maps">cause 8</span></li>
+        <li><b>Garde la valeur B2C solo comme fer de lance.</b> Le bot doit rendre service à <b>un seul chauffeur dès le jour 1</b> (comme ton outil perso), sans dépendre de la densité du groupe — ça contourne le cold-start. <span class="maps">cause 3/4</span></li>
+        <li><b>Sors le userbot de ton numéro principal</b> immédiatement (numéro pro jetable), throttle + jitter, humain dans la boucle du POST, jamais d'auto-post massif. <span class="maps">cause 1</span></li>
+        <li><b>Remplace le regex-par-groupe par une extraction LLM + mesure le recall</b> (logge ce que tu n'as PAS alerté). N'onboarde pas un groupe/une ville tant que le recall sur SES vrais messages n'est pas mesuré. <span class="maps">cause 5</span></li>
+        <li><b>Tranche le format tout de suite :</b> un SaaS multi-tenant 24/7 ne tient pas sur les heures résiduelles d'un chauffeur à plein temps. Soit co-fondateur technique, soit B2C self-serve léger, soit outil perso + petit payant. <span class="maps">cause 6</span></li>
+        <li><b>Socle RGPD minimal</b> avant le 1er client externe : hébergement FR/EU, registre, ne <b>stocke pas</b> les adresses clients, position en opt-in, un conseil avocat budgété. <span class="maps">cause 7</span></li>
+      </ul>
+    </div>
+
+    <div class="scard check">
+      <div class="lbl">✅ Checklist avant de lancer</div>
+      <ul>
+        <li><b>Test « argent » sur 10 chefs</b> — barre de réussite : ≥ 3 posent un acompte ou signent. (tue 2/8 avant de coder)</li>
+        <li><b>Mesure du recoupement des courses</b> entre groupes — seuil d'alerte : &gt; 70 % de doublons.</li>
+        <li><b>Test de densité dans 1 groupe ami</b> — ≥ 60 % des chauffeurs gardent la position active 2 semaines. Sinon, aucun matching ne marchera.</li>
+        <li><b>Audit anti-ban</b> — userbot hors numéro principal ; fréquence des FloodWait mesurée ; posting throttlé.</li>
+        <li><b>Recall parsing sur un groupe NON-fondateur</b> + socle RGPD (FR hosting, pas d'adresses clients stockées) avant le 1er payant.</li>
+      </ul>
+    </div>
+
+  </div>
+</section>
+
+<section>
+  <h2><span class="idx">02</span>Les 8 causes de décès</h2>
+  <p class="sub">Une enquête indépendante par cause : l'histoire de l'échec, l'hypothèse sous-jacente, les signes avant-coureurs.</p>
+  <div class="grid">
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c1)">1</div>
+        <div><h4>Risque plateforme Telegram</h4><span class="sev max">☠ Danger max · proba moyenne</span></div></div>
+      <p class="story">Le userbot reste branché « le temps de migrer ». Au 1er pilote payant, le bot officiel pousse des DM en rafale à des dizaines de chauffeurs par course → <b>429 FloodWait</b> (30 s, 300 s). Les courses arrivent en retard de plusieurs minutes = sans valeur. Un signalement → suspension du bot pour usage commercial ; l'activité auto sur le compte perso → <b>ban du numéro</b>. Perte des groupes source, de l'historique, de la prod, et du gagne-pain de chauffeur. Irrécupérable.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>Telegram est un canal neutre et stable — alors que c'est un tiers hostile qui peut couper l'infra du jour au lendemain.</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>FloodWait qui passe de ~0 à plusieurs/heure au-delà de 20-30 DM/min/groupe · délai course→DM &gt; 60-90 s (throttling) · 1er mail « bot reported ».</p></div>
+    </div>
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c8)">2</div>
+        <div><h4>Payeur ≠ bénéficiaire</h4><span class="sev max">🔴 Très probable</span></div></div>
+      <p class="story">3 chefs pilotes signent en gratuit. Les chauffeurs adorent. Au passage à 49 €/mois, blocage : « c'est bien pour mes gars, mais moi j'y gagne quoi ? » — et il n'y a pas de réponse, la valeur va au chauffeur. Deux chefs sur cinq vivent de l'apport d'affaires : le dispatch auto court-circuite leur rente → ils retirent le bot et préviennent les autres « ça va te faire perdre la main sur ton groupe ». À 6 mois, le seul groupe payant est celui du fondateur.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>Le chef, parce qu'il contrôle le groupe, veut l'optimiser — alors qu'il veut surtout le contrôler, et parfois le monétiser lui-même.</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>Conversion gratuit→payant = 0 après l'essai · en entretien, les chefs parlent des bénéfices « pour leurs chauffeurs », jamais pour eux.</p></div>
+    </div>
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c6)">3</div>
+        <div><h4>Le bot conforme est moins bon que le userbot</h4><span class="sev max">🔴 Très probable</span></div></div>
+      <p class="story">6 chefs sur 10 refusent de donner l'admin « avec accès aux messages » à un bot inconnu (numéros clients, adresses privées). Sans admin, le bot ne voit rien. Côté chauffeurs, l'opt-in position via mini-app (expire à 8 h, batterie, méfiance) tue tout : à 14 h, 7 sur 30 partagent. Le matching propose des courses fantômes à des chauffeurs absents. La magie de l'accès total et silencieux du compte perso ne survit pas à la conformité.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>La magie venait de l'algorithme — alors qu'elle venait de l'accès total et sans friction d'un compte perso, précisément ce que le bot conforme ne peut pas reproduire.</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>Taux d'acceptation admin des chefs &lt; 50 % · &lt; ⅓ des chauffeurs avec position active à l'heure de pointe.</p></div>
+    </div>
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c5)">4</div>
+        <div><h4>Cold-start dans chaque groupe</h4><span class="sev max">🔴 Très probable</span></div></div>
+      <p class="story">Groupe de 40 chauffeurs : 3 curieux activent la position, 37 s'abstiennent. Le bot cherche un chauffeur proche, n'en trouve aucun dans un rayon utile, reste muet, course après course. Les 3 actifs ne décrochent rien (pas assez de densité) et désactivent : « ça bouffe la batterie pour rien ». Le chef ne renouvelle pas : « personne l'utilise, ça n'a jamais matché ». Rien ne récompense le 1er chauffeur qui partage avant que la masse ne soit là.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>Les chauffeurs partageraient leur position par confiance en amont — alors qu'ils ne l'activent qu'après avoir vu une course tomber (œuf-et-poule).</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>Opt-in position &lt; 30 % dans les 2 premières semaines · zéro course matchée avant J+10 → désactivations en cascade.</p></div>
+    </div>
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c3)">5</div>
+        <div><h4>Le parsing ne se généralise pas</h4><span class="sev high">🟠 Probable</span></div></div>
+      <p class="story">1er client à Lyon : « Part-Dieu → St-Ex » — le parseur, calibré Paris, ne connaît rien, géocode au hasard. Chaque correction lyonnaise casse un cas parisien. Puis « 4K5 » (45 €), départ-arrivée collés, vocaux retranscrits fautifs : le recall s'effondre en silence (les ratés ne laissent pas de trace). Coup fatal — les faux positifs : « retour Courbevoie » géocodé comme départ → alerte « proche 6 min », le chauffeur fonce vers une course à l'autre bout. 2-3 fois, il désinstalle.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>Le parseur encode une compétence générale — alors qu'il encode la connaissance intime de 11 groupes précis.</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>Taux d'extraction qui chute sur tout groupe non-parisien · ajout de règles codées « en dur » à chaque onboarding.</p></div>
+    </div>
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c2)">6</div>
+        <div><h4>Effondrement du fondateur solo</h4><span class="sev max">🔴 Très probable</span></div></div>
+      <p class="story">Lune de miel : le fondateur code le soir après 11 h de volant, 3 pilotes signent. Puis la file d'attente invisible : un bug Android vu à un feu rouge attend 9 jours ; OSRM plante un dimanche, un groupe reste sans dispatch tout un week-end de forte demande. Les tickets s'empilent, non lus. Le volant gagne toujours l'arbitrage — il paie le loyer. À 6 mois, le code est figé sur un bug non résolu depuis 6 semaines. Plus personne ne paie.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>Un SaaS multi-tenant 24/7 (vente + support + conformité) peut tourner sur les heures résiduelles d'un homme qui a déjà un métier à plein temps.</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>Délai médian de réponse support &gt; 24 h dès le mois 2 · incidents infra résolus seulement le soir/week-end.</p></div>
+    </div>
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c7)">7</div>
+        <div><h4>RGPD / incident de responsabilité</h4><span class="sev high">🟠 Grave</span></div></div>
+      <p class="story">Un chef en litige exige « toutes les données sur moi et mes clients » : pas de registre, pas de politique de conservation, aucune réponse dans les délais → il arrête et prévient le réseau. Un chauffeur découvre que les adresses domicile de ses clientes transitent par « le bot d'un mec » et poste des captures dans un groupe de 800 chauffeurs. Un chauffeur banni de Telegram accuse l'outil ; une rumeur « l'appli qui te fait conduire les yeux sur le tel » circule. Ni le temps ni les 4-5 k€ d'avocat pour éteindre l'incendie.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>« Je peux traiter de la géoloc temps réel, des adresses de tiers et des paiements sans cadre RGPD, parce que je suis petit et que personne ne regardera. »</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>1re demande d'accès/suppression sans réponse propre · un chauffeur demande « où sont hébergées les données, qui y accède ? » sans réponse écrite prête.</p></div>
+    </div>
+
+    <div class="fcard">
+      <div class="top"><div class="fnum" style="background:var(--c4)">8</div>
+        <div><h4>Marché plus petit / fragmenté · migration WhatsApp</h4><span class="sev max">🔴 Très probable</span></div></div>
+      <p class="story">Dès la prospection : les mêmes 30 courses repostées dans 15 groupes. Aucun groupe n'a de stock propre ; un chauffeur suit 8-12 groupes et prend la 1re course. « Ton groupe = ta communauté monétisable » s'effondre : le chef relaie, ne possède rien. Les vrais chefs payeurs sont une poignée : sur 40 groupes contactés, 4 répondent, 1 teste, 0 renouvelle. À M4, deux gros groupes basculent leur dispatch sérieux sur WhatsApp → le produit, verrouillé sur Telegram, devient hors-sol.</p>
+      <div class="kv"><span class="k">Hypothèse sous-jacente</span><p>Un « groupe Telegram » est un actif captif possédé par un chef — alors que c'est un flux fongible, redondant et volatile que personne ne détient vraiment.</p></div>
+      <div class="kv warn"><span class="k">Signes avant-coureurs</span><p>Recoupement des courses &gt; 70 % entre groupes · &lt; 10 % des chefs contactés acceptent une démo, 0 engagement récurrent au mois 1.</p></div>
+    </div>
+
+  </div>
+</section>
+
+</main>
+<footer><div class="wrap">
+  <div><b style="color:var(--ink)">Premortem — Lancement de PROXIA</b> · généré le 25 juillet 2026</div>
+  <div class="agentsrow">
+    <span class="achip">8 enquêteurs · en parallèle</span>
+    <span class="achip">méthode Klein (prospective hindsight)</span>
+    <span class="achip">objet : SaaS dispatch VTC B2B2C</span>
+  </div>
+  <p style="margin-top:14px;max-width:64ch;">Un premortem n'est utile que tant qu'on peut encore changer de cap. Les chiffres et seuils sont des repères de décision, pas des prédictions — à confronter au terrain avant tout engagement.</p>
+</div></footer>
+</body>
+</html>

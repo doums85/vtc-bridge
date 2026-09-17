@@ -1,0 +1,43 @@
+[Unit]
+Description=Pont VTC <-> Hermes (Telethon)
+Documentation=file:///opt/vtc-bridge/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=vtc
+Group=vtc
+WorkingDirectory=/opt/vtc-bridge
+# Le .env est lu par load_dotenv() depuis WorkingDirectory : pas d'EnvironmentFile,
+# pour eviter toute divergence entre la syntaxe dotenv et celle de systemd.
+ExecStart=/opt/vtc-bridge/.venv/bin/python -u /opt/vtc-bridge/vtc_bridge.py
+Restart=always
+RestartSec=10s
+TimeoutStopSec=30s
+KillSignal=SIGINT
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vtc-bridge
+
+# Durcissement
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/opt/vtc-bridge
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

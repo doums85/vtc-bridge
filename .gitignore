@@ -1,0 +1,22 @@
+# Secrets — ne jamais versionner
+.env
+*.session
+*.session-journal
+
+# État d'exécution : base des courses, position live
+state/
+__pycache__/
+*.pyc
+
+# Journaux : contiennent les messages bruts des groupes
+logs/
+*.log
+
+# Environnement Python
+.venv/
+
+# Outillage local
+.codegraph/
+.claude/
+.DS_Store
+.gstack/

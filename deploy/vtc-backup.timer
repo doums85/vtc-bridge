@@ -1,0 +1,11 @@
+[Unit]
+Description=Declenche la sauvegarde quotidienne de la base VTC
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Rattrape la sauvegarde si le serveur etait eteint a l'heure prevue.
+Persistent=true
+Unit=vtc-backup.service
+
+[Install]
+WantedBy=timers.target

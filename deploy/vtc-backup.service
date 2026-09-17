@@ -1,0 +1,49 @@
+[Unit]
+Description=Sauvegarde quotidienne de la base VTC
+Documentation=file:///opt/vtc-bridge/deploy/README.md
+After=vtc-bridge.service
+
+[Service]
+Type=oneshot
+User=vtc
+Group=vtc
+WorkingDirectory=/opt/vtc-bridge
+# StateDirectory cree /var/lib/vtc-bridge (proprietaire vtc) et l'ajoute aux chemins
+# inscriptibles : aucun mkdir a prevoir, et les archives survivent au rsync --delete
+# de deploy.sh, qui ne touche qu'a /opt/vtc-bridge.
+StateDirectory=vtc-bridge
+StateDirectoryMode=0750
+
+# Copie hors du serveur : Storage Box Hetzner vtc-backups, en SSH sur le port 23.
+# La cle privee est nee sur ce serveur et n'en sort pas ; le Storage Box n'accepte
+# que cette cle et n'est joignable que depuis le reseau Hetzner.
+Environment=BACKUP_REMOTE=u671222@u671222.your-storagebox.de
+Environment=BACKUP_REMOTE_PATH=vtc-bridge
+Environment=BACKUP_REMOTE_PORT=23
+Environment=BACKUP_SSH_KEY=/var/lib/vtc-bridge/ssh/id_ed25519_storagebox
+Environment=BACKUP_KNOWN_HOSTS=/var/lib/vtc-bridge/ssh/known_hosts
+
+ExecStart=/opt/vtc-bridge/.venv/bin/python -u /opt/vtc-bridge/deploy/backup.py
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vtc-backup
+
+# Durcissement, aligne sur vtc-bridge.service
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# PrivateNetwork reste desactive : rsync doit joindre le Storage Box.
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# state/ reste inscriptible : SQLite doit pouvoir poser le -shm d'une base en mode WAL,
+# meme ouverte en lecture seule. Le reste du systeme est en lecture seule.
+ReadWritePaths=/opt/vtc-bridge/state
+MemoryMax=256M
