@@ -51,7 +51,7 @@ virtuel Python, plafonne les journaux à 500 Mo et ferme tout sauf SSH en entré
 VPS=root@1.2.3.4 ./deploy/deploy.sh
 ```
 
-### 3. Transférer les secrets et l'état
+### 3. Transférer les sessions et l'état
 
 Arrête d'abord le pont sur ton Mac : le script refuse de continuer s'il le voit tourner,
 car copier une base SQLite en cours d'écriture donne un fichier incohérent.
@@ -60,10 +60,9 @@ car copier une base SQLite en cours d'écriture donne un fichier incohérent.
 VPS=root@1.2.3.4 ./deploy/first-sync.sh
 ```
 
-> **Avertissement.** `vtc_session.session` donne un accès complet à ton compte Telegram,
-> et `.env` contient tes identifiants d'API. Ces fichiers ne transitent que par `scp`,
-> jamais par mail, messagerie, stockage en ligne ou dépôt Git. Sur le serveur ils sont
-> en mode 600, lisibles par le seul utilisateur `vtc`.
+> **Avertissement.** `vtc_session.session` donne un accès complet à ton compte Telegram.
+> Ce fichier ne transite que par `scp`, jamais par mail, messagerie, stockage en ligne ou
+> dépôt Git. Sur le serveur il est en mode 600, lisible par le seul utilisateur `vtc`.
 
 ### 4. Première connexion, à la main
 
@@ -88,8 +87,32 @@ VPS=root@1.2.3.4 ./deploy/deploy.sh
 
 Le script installe l'unité systemd, l'active au démarrage et lance le pont. À partir
 de là, chaque modification du code se déploie avec cette seule commande. `deploy.sh`
-ne touche ni au `.env`, ni aux sessions, ni à `state/` : ces fichiers ne vivent plus
-que sur le serveur.
+ne touche ni aux sessions, ni à `state/` : ces fichiers ne vivent que sur le serveur.
+
+## Secrets : Infisical
+
+Les variables d'environnement vivent dans Infisical, projet `vtc-bridge`, environnement
+`prod`. C'est la source de vérité. Le `.env` du serveur n'en est qu'une copie, régénérée
+à chaque `deploy.sh` :
+
+```
+infisical export --env=prod --format=dotenv   # sur le Mac, puis scp vers le serveur
+```
+
+Le pont lit un fichier local, pas Infisical directement. Ce choix est délibéré : si
+Infisical est injoignable au démarrage, le pont démarre quand même. Seul un déploiement
+a besoin du réseau vers Infisical.
+
+Deux garde-fous dans `deploy.sh` avant d'écraser le `.env` de production : l'export doit
+contenir au moins vingt variables et la clé `TG_API_HASH`. En dessous, rien n'est envoyé
+et le déploiement s'arrête. `SKIP_SECRETS=1` saute l'étape pour déployer du code seul.
+
+Pour changer un secret : le modifier dans Infisical, puis relancer `deploy.sh`. Le
+`.env` local du Mac n'est plus utilisé pour la production ; il ne sert qu'à lancer le
+pont en local.
+
+Le fichier `.infisical.json` versionné ne contient que l'identifiant du projet, aucun
+secret. Il évite de répéter `--projectId` à chaque commande.
 
 ## Exploitation
 

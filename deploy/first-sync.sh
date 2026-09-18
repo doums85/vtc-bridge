@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# TRANSFERT UNIQUE des secrets et de l'etat vers le VPS : .env, sessions Telegram, base courses.db.
+# TRANSFERT UNIQUE de l'etat vers le VPS : sessions Telegram et base courses.db.
+# Le .env n'est plus transfere ici : deploy.sh le regenere depuis Infisical.
 # A lancer une seule fois, apres server-setup.sh et avant deploy.sh.
 #   usage : VPS=root@1.2.3.4 ./deploy/first-sync.sh
 set -euo pipefail
@@ -33,9 +34,8 @@ db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 db.close()
 PY
 
-echo "== envoi des secrets et de l'etat =="
+echo "== envoi des sessions et de l'etat =="
 ssh "$VPS" "mkdir -p $APP_DIR/state"
-scp .env "$VPS:$APP_DIR/.env"
 scp vtc_session.session "$VPS:$APP_DIR/"
 [ -f vtc_bot.session ] && scp vtc_bot.session "$VPS:$APP_DIR/"
 scp state/courses.db "$VPS:$APP_DIR/state/courses.db"
@@ -43,7 +43,7 @@ scp state/courses.db "$VPS:$APP_DIR/state/courses.db"
 
 ssh "$VPS" bash -euo pipefail <<REMOTE
 chown -R $APP_USER:$APP_USER $APP_DIR
-chmod 600 $APP_DIR/.env $APP_DIR/*.session
+chmod 600 $APP_DIR/*.session
 chmod 700 $APP_DIR/state
 REMOTE
 
