@@ -23,9 +23,12 @@ le texte expansé, pour que `P10`, `Paris 10` et `75010` convergent — reconna�
 course repostée ailleurs. Quand le message n'offre pas assez de signal géographique, un
 repli sur le texte normalisé couvre le cas, avec une fenêtre plus courte.
 
-**Alertes actionnables.** Chaque alerte arrive en message privé avec des boutons : prendre
-la course, répondre « SP », proposer un délai. Sans réponse, l'alerte expire et les boutons
-se neutralisent.
+**Alertes actionnables.** Chaque alerte arrive en message privé avec deux boutons :
+« Accepter » et « Refuser ». « Accepter » recalcule le temps de trajet jusqu'au départ depuis
+ta position du moment et propose les délais à annoncer, le meilleur marqué ⭐ : « SP » sous
+5 minutes, sinon le temps réel arrondi à la minute au-dessus, puis les paliers de 5 minutes
+suivants. Un tap envoie la réponse dans le groupe. Sans réponse, l'alerte expire et les
+boutons se neutralisent.
 
 **Comptabilité.** Les courses acceptées alimentent une base SQLite : chiffre d'affaires,
 commission de l'apporteur, net. Bilans du jour, de la semaine et du mois par commande, plus
