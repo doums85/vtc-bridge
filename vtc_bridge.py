@@ -25,6 +25,7 @@ import os
 import re
 import html
 import json
+import math
 import io
 import time
 import unicodedata
@@ -61,8 +62,8 @@ RESA_REPLY = os.environ.get("RESA_REPLY", "ok").strip()               # réponse
 # Code couleur rentabilité : >= GOOD 🟢, >= MID 🟠, sinon 🔴
 EURKM_GOOD = float(os.environ.get("EURKM_GOOD", "2.0"))
 EURKM_MID  = float(os.environ.get("EURKM_MID", "1.5"))
-# Boutons de réponse rapide proposés sous chaque alerte (en plus de la suggestion).
-QUICK_REPLIES = [q.strip() for q in os.environ.get("QUICK_REPLIES", "SP,5,10,15,20").split(",") if q.strip()]
+# Nombre de temps proposés après « Accepter » (le meilleur + les paliers de 5 min au-dessus).
+TIME_CHOICES = int(os.environ.get("TIME_CHOICES", 3))
 # Sans réponse au-delà de ce délai, l'alerte est marquée "expirée" (boutons neutralisés).
 EXPIRE_SECONDS = int(os.environ.get("EXPIRE_SECONDS", 15 * 60))
 # Fenêtre de déduplication inter-groupes : une même course repostée dans un autre groupe
@@ -146,6 +147,7 @@ client = TelegramClient(SESSION, API_ID, API_HASH)          # session utilisateu
 bot = TelegramClient("vtc_bot", API_ID, API_HASH) if BOT_TOKEN else None  # bot dédié aux boutons
 _seen_courses: set[tuple[int, int]] = set()   # dédup (groupe, message id) : ne traite pas 2× le même message
 _pending_alerts: dict[int, int] = {}          # id message alerte DM -> id course en base (alertes encore actives)
+_alert_ctx: dict[int, dict] = {}              # id message alerte DM -> contexte (texte, départ, ETA) pour « Accepter »
 _dup_seen: dict[str, float] = {}              # empreinte de course -> ts : dédup inter-groupes (même course, autre groupe)
 GROUP_NAMES: dict[int, str] = {}              # id groupe -> nom lisible (résolu au démarrage)
 BOT_SELF_ID: int = 0                           # id du bot (pour ne pas doubler /note dans son DM)
@@ -723,6 +725,7 @@ async def _geo_route(session, from_coords, to_text: str):
 async def _expire_alert(msg_id: int) -> None:
     """Passé EXPIRE_SECONDS sans réponse, neutralise l'alerte."""
     await asyncio.sleep(EXPIRE_SECONDS)
+    _alert_ctx.pop(msg_id, None)
     cid = _pending_alerts.pop(msg_id, None)
     if cid is None:                            # déjà répondue / passée
         return
@@ -736,38 +739,73 @@ async def _expire_alert(msg_id: int) -> None:
         pass
 
 
+def time_options(eta_s: float) -> "tuple[str, list[str]]":
+    """Temps à annoncer pour rejoindre le départ : (meilleur, choix proposés).
+    Le meilleur = le plus petit délai réellement tenable (ETA arrondie à la minute
+    supérieure, « SP » sous SP_UNDER_SECONDS) : annoncer moins = arriver en retard,
+    annoncer plus = se faire doubler. Les autres choix = paliers de 5 min au-dessus."""
+    if eta_s < SP_UNDER_SECONDS:
+        best = "SP"
+        base = 0                               # SP, puis 5, 10…
+    else:
+        best = str(math.ceil(eta_s / 60))
+        base = int(best)
+    opts = [best]
+    step = (base // 5 + 1) * 5                 # palier de 5 strictement au-dessus
+    while len(opts) < max(1, TIME_CHOICES):
+        opts.append(str(step))
+        step += 5
+    return best, opts
+
+
+def _decision_rows(gid: int, mid: int) -> list:
+    """Boutons d'une alerte fraîche : Accepter / Refuser (+ lien vers la course)."""
+    rows = [[Button.inline("✅ Accepter", f"a|{gid}|{mid}".encode()),
+             Button.inline("❌ Refuser", b"x")]]
+    link = course_link(gid, mid)
+    if link:
+        rows.append([Button.url("🔗 Voir la course", link)])
+    return rows
+
+
 async def deliver_alert(dm_body: str, feed_body: str, reply: str, gid: int, mid: int,
-                        course: "dict | None" = None) -> None:
-    """Bot configuré -> DM propre (HTML) + boutons. Sinon -> texte technique dans le relais (Hermès).
-    Si `course` est fourni, la course est journalisée (statut « proposée ») pour le résumé."""
+                        course: "dict | None" = None, pickup_coords=None,
+                        eta_s: "float | None" = None) -> None:
+    """Bot configuré -> DM propre (HTML) + boutons Accepter / Refuser. Sinon -> texte technique
+    dans le relais (Hermès). Si `course` est fourni, la course est journalisée (statut « proposée »).
+    `pickup_coords` / `eta_s` servent à recalculer le temps depuis ta position au moment d'accepter."""
     if bot and NOTIFY_USER_ID:
-        # choix de réponse : la suggestion (marquée ✅) + les délais rapides, sans doublon
-        choices = list(QUICK_REPLIES)
-        if reply not in choices:
-            choices.insert(0, reply)
-        btns = [Button.inline(("✅ " if c == reply else "") + c, f"s|{gid}|{mid}|{c}".encode())
-                for c in choices]
-        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]   # rangées de 3
-        rows.append([Button.inline("❌ Passer", b"x")])
-        link = course_link(gid, mid)
-        if link:
-            rows.append([Button.url("🔗 Voir la course", link)])
-        sent = await bot.send_message(NOTIFY_USER_ID, dm_body, buttons=rows,
+        sent = await bot.send_message(NOTIFY_USER_ID, dm_body, buttons=_decision_rows(gid, mid),
                                       parse_mode="html", link_preview=False)
         if course is not None:
             cid = store.record_course(alert_id=sent.id, reply=reply, **course)
             _pending_alerts[sent.id] = cid
+        _alert_ctx[sent.id] = dict(body=dm_body, reply=reply, pickup=pickup_coords, eta_s=eta_s)
         asyncio.create_task(_expire_alert(sent.id))
     else:
         body = feed_body + (f"\n{BOT_MENTION}" if BOT_MENTION else "")
         await client.send_message(FEED_GROUP, body)
 
 
+async def _fresh_eta(ctx: dict) -> "tuple[float, float | None, bool] | None":
+    """ETA vers le départ depuis ta position ACTUELLE : (secondes, mètres, à_jour).
+    Repli sur l'ETA calculée à l'arrivée de l'alerte si la position ou le routage manque."""
+    src = load_position()
+    if ctx.get("pickup") and src is not None:
+        async with aiohttp.ClientSession() as session:
+            rt = await route_eta(session, src, ctx["pickup"])
+        if rt:
+            return rt[0], rt[1], True
+    if ctx.get("eta_s") is not None:
+        return ctx["eta_s"], None, False
+    return None
+
+
 async def escalate(session, text_original: str, dep_text: str, pickup_coords,
                    eta_s: float, dist_m: float, gid: int, mid: int) -> None:
     prox = round(eta_s / 60)                        # temps pour rejoindre le départ
     # Règle de réponse VTC : < 5 min -> "SP" (sur place), sinon le délai en minutes
-    reply = "SP" if eta_s < SP_UNDER_SECONDS else str(prox)
+    reply = time_options(eta_s)[0]
     link = course_link(gid, mid)
     price = extract_price(text_original)
     arr_text = extract_dropoff(text_original)
@@ -803,7 +841,8 @@ async def escalate(session, text_original: str, dep_text: str, pickup_coords,
         + f"[GID {gid}]\n──────────\n{text_original}\n──────────\n"
         f"→ Hermès : propose d'envoyer « {reply} » (valide avant envoi)."
     )
-    await deliver_alert(dm_body, feed_body, reply, gid, mid, course)
+    await deliver_alert(dm_body, feed_body, reply, gid, mid, course,
+                        pickup_coords=pickup_coords, eta_s=eta_s)
     log.info("Course proche escaladée (à %s min | PEC=%r | brut=%r).",
              prox, dep_text, text_original[:70].replace("\n", " "))
 
@@ -1698,12 +1737,64 @@ if bot is not None:
             return
         data = event.data.decode("utf-8", "ignore")
 
-        # ── ❌ Passer : la course n'est pas prise ──
+        # ── ❌ Refuser : la course n'est pas prise ──
         if data == "x":
+            _alert_ctx.pop(event.message_id, None)
             cid = _pending_alerts.pop(event.message_id, None)
             if cid:
                 store.set_status(cid, "passée")
-            await event.edit("⏭️ <b>Course passée</b>", parse_mode="html")
+            await event.edit("❌ <b>Course refusée</b>", parse_mode="html")
+            return
+
+        # ── ✅ Accepter : propose les temps calculés depuis ta position, le meilleur en tête ──
+        # ── ⬅️ Retour : revient au choix Accepter / Refuser ──
+        if data.startswith(("a|", "b|")):
+            try:
+                _, sgid, smid = data.split("|", 2)
+                gid, mid = int(sgid), int(smid)
+            except ValueError:
+                await event.answer("Donnée invalide", alert=True)
+                return
+            ctx = _alert_ctx.get(event.message_id)
+            if ctx is None or event.message_id not in _pending_alerts:
+                await event.answer("⏱️ Alerte expirée — rien envoyé.", alert=True)
+                return
+            if data.startswith("b|"):
+                await event.edit(ctx["body"], buttons=_decision_rows(gid, mid),
+                                 parse_mode="html", link_preview=False)
+                return
+            back = Button.inline("⬅️ Retour", f"b|{gid}|{mid}".encode())
+            refuse = Button.inline("❌ Refuser", b"x")
+            if ctx.get("eta_s") is None:
+                # Réservation : pas de délai à annoncer, la réponse est la confirmation.
+                rows = [[Button.inline(f"⭐ {ctx['reply']}", f"s|{gid}|{mid}|{ctx['reply']}".encode())],
+                        [back, refuse]]
+                await event.edit(
+                    f"{ctx['body']}\n\n{HR}\n✅ <b>Réponse à envoyer</b>{MID}⭐ « {html.escape(ctx['reply'])} »",
+                    buttons=rows, parse_mode="html", link_preview=False)
+                return
+            await event.answer("🧭 Calcul depuis ta position…")
+            fresh = await _fresh_eta(ctx)
+            eta_now, dist_now, live = fresh
+            best, opts = time_options(eta_now)
+
+            def label(o: str) -> str:
+                return "SP (sur place)" if o == "SP" else f"{o} min"
+
+            btns = [Button.inline(("⭐ " if o == best else "") + label(o), f"s|{gid}|{mid}|{o}".encode())
+                    for o in opts]
+            rows = [btns[:1], btns[1:]] if len(btns) > 1 else [btns]
+            rows.append([back, refuse])
+            where = (f"🧭 Depuis ta position : <b>{round(eta_now / 60)} min</b>"
+                     + (f"{MID}{dist_now / 1000:.1f} km" if dist_now else "")
+                     if live else
+                     f"🧭 <i>Position indisponible — temps calculé à l'arrivée de l'alerte</i> : "
+                     f"<b>{round(eta_now / 60)} min</b>")
+            await event.edit(
+                f"{ctx['body']}\n\n{HR}\n{where}\n"
+                f"⭐ <b>Meilleur temps : {label(best)}</b>\n"
+                f"<i>Arrondi à la minute au-dessus : annoncer moins = retard, plus = tu te fais doubler.</i>",
+                buttons=rows, parse_mode="html", link_preview=False)
             return
 
         # ── 📄 Tableau détaillé (fichier HTML) ──
@@ -1884,6 +1975,7 @@ if bot is not None:
         if gid not in VTC_GROUPS:
             await event.answer("Groupe non autorisé", alert=True)
             return
+        _alert_ctx.pop(event.message_id, None)
         cid = _pending_alerts.pop(event.message_id, None)
         if cid is None:                                            # expirée ou déjà répondue
             await event.answer("⏱️ Alerte expirée — rien envoyé.", alert=True)
