@@ -277,6 +277,29 @@ async def run() -> bool:
     await on_command(Ev(B_ID, text="/prixmin 9999"))
     ok &= check("valeur hors bornes refusée", b.cfg("min_price"), 0)
 
+    print("\n— partage de position : durée limitée ou sans fin")
+    on_location = HANDLERS["on_bot_location_new"]
+
+    def geo_event(period):
+        ev = Ev(A_ID)
+        ev.message = SimpleNamespace(geo=SimpleNamespace(lat=48.85, long=2.35), reply_to=None,
+                                     media=SimpleNamespace(period=period) if period else None)
+        return ev
+
+    ev = geo_event(8 * 3600)
+    await on_location(ev)
+    ok &= check("partage 8 h : rappel programmé", a.pos_expiry_task is not None, True)
+    ok &= check("partage 8 h : message annonce la durée", "8 h" in ev.responses[0][0], True)
+    ev = geo_event(v.LIVE_INDEFINITE)
+    await on_location(ev)
+    ok &= check("partage sans fin : ancien rappel annulé, aucun nouveau", a.pos_expiry_task, None)
+    ok &= check("partage sans fin : message « sans limite »", "sans limite" in ev.responses[0][0], True)
+    ev = geo_event(None)
+    await on_location(ev)
+    ok &= check("position ponctuelle : le chauffeur est prévenu", "ponctuelle" in ev.responses[0][0], True)
+    ok &= check("position ponctuelle : aucun rappel", a.pos_expiry_task, None)
+    ok &= check("position enregistrée", v.load_position(a)["lat"], 48.85)
+
     print("\n— inconnu en message privé")
     ev = Ev(777, text="/resume")
     await on_command(ev)

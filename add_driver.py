@@ -99,7 +99,8 @@ async def cmd_add(args) -> None:
                         is_owner=True if args.owner else None)
     print(f"\n{'Mis à jour' if existed else 'Ajouté'} : {name} (id {me.id}), {len(groups)} groupe(s).")
     print("Dernière étape, côté chauffeur : ouvrir le bot Telegram, envoyer /start, puis partager "
-          "sa position en direct (📎 → Position → en direct → 8 h).")
+          "sa position en direct (📎 → Position → en direct → la durée la plus longue, "
+          "« jusqu'à ce que je l'arrête » si Telegram la propose).")
     print("Le pont le prend en compte sous une minute. Ses réglages : /reglages dans le bot.")
 
 

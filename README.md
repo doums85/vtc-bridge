@@ -142,9 +142,16 @@ Le calcul de proximité a besoin de savoir où est chaque chauffeur. Il partage 
 jour, qui arrivent sous forme d'éditions du message. Le groupe relais reste possible pour le
 chauffeur d'origine (`FEED_GROUP`).
 
-Telegram coupe ce partage au bout de huit heures. Sans position fraîche, les courses
-immédiates sont ignorées et le journal le dit : `Position périmée`. Les réservations, elles,
-continuent d'être traitées.
+**Partager une seule fois.** Dans le menu de partage, choisis la durée la plus longue
+proposée. Les versions récentes de Telegram offrent un partage sans fin, qui tient jusqu'à ce
+que tu l'arrêtes toi-même : le bot confirme alors « sans limite de durée » et ne rappelle
+plus rien. Sur une version qui n'a pas cette option, le maximum est de huit heures : le bot
+te prévient 15 minutes avant la fin.
+
+Sans position fraîche, les courses immédiates sont ignorées et le journal le dit :
+`Position périmée`. Le seuil se règle avec `POSITION_STALE_SECONDS` (24 h par défaut). Un
+partage sans fin n'envoie une mise à jour que lorsque le téléphone bouge : un chauffeur à
+l'arrêt garde sa dernière position. Les réservations continuent d'être traitées sans position.
 
 ## Sécurité
 

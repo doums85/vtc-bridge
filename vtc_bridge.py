@@ -940,10 +940,21 @@ async def escalate(drv: DriverRT, session, text_original: str, dep_text: str, pi
              drv.tag, prox, dep_text, text_original[:70].replace("\n", " "))
 
 
+# Telegram code un partage « sans fin » par une durée de 0x7FFFFFFF s (plus de 68 ans).
+# Dès qu'une durée atteint ce seuil, il n'y a rien à relancer : pas de rappel d'expiration.
+LIVE_INDEFINITE = 0x7FFFFFFF
+LIVE_HOWTO = ("<i>📎 → Position → Partager ma position en direct → la durée la plus longue "
+              "proposée (« jusqu'à ce que je l'arrête » si ton Telegram l'affiche, sinon 8 h).</i>")
+
+
 def schedule_live_expiry(drv: DriverRT, period: int) -> None:
-    """Programme un rappel LIVE_REMIND_BEFORE avant la fin d'un partage de position en direct."""
+    """Programme un rappel LIVE_REMIND_BEFORE avant la fin d'un partage de position en direct.
+    Un partage sans fin annule le rappel d'un partage précédent et n'en programme aucun."""
     if drv.pos_expiry_task and not drv.pos_expiry_task.done():
         drv.pos_expiry_task.cancel()
+    drv.pos_expiry_task = None
+    if period >= LIVE_INDEFINITE:
+        return
     drv.pos_expiry_task = asyncio.create_task(
         _live_expiry_reminder(drv, max(0, period - LIVE_REMIND_BEFORE)))
 
@@ -961,7 +972,7 @@ async def _live_expiry_reminder(drv: DriverRT, delay: float) -> None:
             "⏰ <b>Ta position expire bientôt</b>\n"
             f"{HR}\n"
             "Relance le partage en direct pour rester couvert sans interruption :\n"
-            "<i>📎 → Position → Partager ma position en direct → 8 h.</i>",
+            + LIVE_HOWTO,
             parse_mode="html")
     except Exception:                       # noqa: BLE001
         pass
@@ -1031,7 +1042,7 @@ async def warn_position(drv: DriverRT) -> None:
             f"{HR}\n"
             "Je ne reçois plus ta position — impossible de repérer les courses proches.\n\n"
             "👉 Partage ta <b>position en direct</b> ici, dans ce chat :\n"
-            "<i>📎 → Position → Partager ma position en direct → 8 h.</i>",
+            + LIVE_HOWTO,
             parse_mode="html")
     except Exception:                       # noqa: BLE001
         pass
@@ -2290,17 +2301,32 @@ if bot is not None:
         drv = DRIVERS.get(event.sender_id)
         if drv is None or event.message.geo is None:
             return
-        was_missing = load_position(drv) is None
         save_position(drv, event.message.geo.lat, event.message.geo.long)
         period = getattr(event.message.media, "period", None)   # durée du partage live (ex. 28800 = 8 h)
         if period:
             schedule_live_expiry(drv, period)
-        if was_missing:
-            await event.respond(
-                "✅ <b>Position activée</b>\n"
-                f"{HR}\n"
-                "Je surveille les courses proches. 🚕 <i>(garde le partage en direct actif.)</i>",
-                parse_mode="html")
+        # Un NOUVEAU message de position = un partage qui démarre (les mises à jour arrivent
+        # en éditions). On confirme et on dit combien de temps il tient.
+        if not period:
+            body = ("📍 <b>Position reçue, mais ponctuelle</b>\n"
+                    f"{HR}\n"
+                    "Elle ne se met pas à jour. Pour suivre les courses proches, partage-la "
+                    "<b>en direct</b> :\n" + LIVE_HOWTO)
+        elif period >= LIVE_INDEFINITE:
+            body = ("✅ <b>Position activée, sans limite de durée</b>\n"
+                    f"{HR}\n"
+                    "Je surveille les courses proches. 🚕 Rien à relancer : le partage tient "
+                    "jusqu'à ce que tu l'arrêtes toi-même.")
+        else:
+            hours = period / 3600
+            span = f"{hours:g} h" if hours >= 1 else f"{round(period / 60)} min"
+            body = (f"✅ <b>Position activée pour {span}</b>\n"
+                    f"{HR}\n"
+                    f"Je surveille les courses proches. 🚕 Je te préviens "
+                    f"{LIVE_REMIND_BEFORE // 60} min avant la fin.\n"
+                    "Pour ne plus avoir à relancer, choisis la durée la plus longue "
+                    "proposée par Telegram (« jusqu'à ce que je l'arrête » si elle apparaît).")
+        await event.respond(body, parse_mode="html")
 
     @bot.on(events.MessageEdited(func=lambda e: e.is_private))
     async def on_bot_location_edit(event):
