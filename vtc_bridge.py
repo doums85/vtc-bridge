@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
-Pont VTC <-> Hermès (Telethon / compte utilisateur).
+Pont VTC <-> Telegram (Telethon), multi-chauffeurs.
 
-Rôle :
-  1. Lit les groupes VTC où tu es simple membre (impossible avec le Bot API de Hermès).
-  2. Suit ta position en direct (live location Telegram partagée dans le groupe-relais).
+Un chauffeur = un compte Telegram = un profil (table `drivers`) avec ses groupes, sa
+position en direct, ses réglages et son journal de courses. Le pont ouvre une session
+Telethon par chauffeur et un seul bot partagé pour les alertes.
+
+Rôle, pour chaque chauffeur :
+  1. Lit les groupes VTC où il est simple membre (impossible avec le Bot API).
+  2. Suit sa position en direct (live location partagée dans le DM du bot).
   3. Pour chaque course postée : extrait l'adresse de prise en charge, géocode (Nominatim),
-     calcule l'ETA en voiture (OSRM). Si ETA <= SEUIL (8 min) -> escalade vers Hermès.
-  4. Canal retour : quand Hermès poste "[SEND <group_id>] <texte>" dans le relais,
-     le pont envoie ce texte dans le vrai groupe VTC (depuis TON compte).
+     calcule l'ETA en voiture. Il ne reçoit QUE ce qui passe SES réglages (temps, distance,
+     prix minimum, €/km, rayon des réservations…) : /reglages dans le DM du bot.
+  4. Ses taps sur « Accepter » postent la réponse dans le groupe depuis SON compte.
 
-Dépendances : pip install telethon aiohttp python-dotenv
-Login : au 1er lancement, Telethon demande ton numéro + le code reçu par Telegram.
+Ajouter un chauffeur : `python add_driver.py add` (connexion Telegram de son compte).
+
+Dépendances : pip install telethon aiohttp python-dotenv fpdf2
 
 ⚠️ Automatiser un compte utilisateur est en zone grise des CGU Telegram.
-   Reste en lecture + envoi VALIDÉ manuellement (le point 4 n'envoie que ce que
-   tu as approuvé via Hermès). N'en fais pas un auto-répondeur massif : c'est ça
-   qui fait bannir un compte.
+   Le pont n'envoie que ce que le chauffeur a validé d'un tap. N'en fais pas un
+   auto-répondeur massif : c'est ça qui fait bannir un compte.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import sys
 import html
 import json
 import math
@@ -39,33 +44,28 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault, DocumentAttributeFilename
 
 import store
+import drivers as D
 
 load_dotenv()
 
 # ─────────────────────────── Config ───────────────────────────
-API_ID   = int(os.environ["TG_API_ID"])            # my.telegram.org
+API_ID   = int(os.environ["TG_API_ID"])            # my.telegram.org (commun à tous les comptes)
 API_HASH = os.environ["TG_API_HASH"]
 SESSION  = os.environ.get("TG_SESSION", "vtc_session")
 
-# ids des groupes VTC (négatifs, ex : -1001234567890). Sépare par des virgules.
-VTC_GROUPS = [int(x) for x in os.environ["VTC_GROUPS"].split(",") if x.strip()]
-# groupe privé relais où le bot Hermès est admin (privacy OFF) ET où TU partages ta live location.
-FEED_GROUP = int(os.environ["FEED_GROUP"])
+# Chauffeur d'origine (avant le multi-chauffeurs). Au premier lancement sur une base sans
+# aucun chauffeur, il est créé depuis ces variables : session TG_SESSION, id NOTIFY_USER_ID,
+# groupes VTC_GROUPS, relais FEED_GROUP. Ensuite, la table `drivers` fait foi.
+LEGACY_GROUPS = [int(x) for x in os.environ.get("VTC_GROUPS", "").split(",") if x.strip()]
+LEGACY_FEED_GROUP = int(os.environ.get("FEED_GROUP", "0") or "0")
 # mention du bot Hermès (ex "@mon_hermes_bot") pour déclencher son traitement des alertes.
 BOT_MENTION = os.environ.get("BOT_MENTION", "").strip()
 
-THRESHOLD_SECONDS = int(os.environ.get("THRESHOLD_SECONDS", 8 * 60))   # 8 min : au-delà, on ignore
-SP_UNDER_SECONDS  = int(os.environ.get("SP_UNDER_SECONDS", 5 * 60))    # < 5 min : la réponse est "SP"
-# Réservations (course pour plus tard) : on notifie sur la rentabilité, pas la proximité.
-EURKM_MIN  = float(os.environ.get("EURKM_MIN", "1.5"))                 # seuil €/km d'une réservation
-RESA_REPLY = os.environ.get("RESA_REPLY", "ok").strip()               # réponse suggérée pour une réservation
-# Code couleur rentabilité : >= GOOD 🟢, >= MID 🟠, sinon 🔴
-EURKM_GOOD = float(os.environ.get("EURKM_GOOD", "2.0"))
-EURKM_MID  = float(os.environ.get("EURKM_MID", "1.5"))
-# Nombre de temps proposés après « Accepter » (le meilleur + les paliers de 5 min au-dessus).
-TIME_CHOICES = int(os.environ.get("TIME_CHOICES", 3))
-# Sans réponse au-delà de ce délai, l'alerte est marquée "expirée" (boutons neutralisés).
-EXPIRE_SECONDS = int(os.environ.get("EXPIRE_SECONDS", 15 * 60))
+# Les seuils (temps, distance, prix min, €/km, commission, expiration…) sont des RÉGLAGES
+# PAR CHAUFFEUR : définition, bornes et valeurs par défaut dans drivers.py. Les variables
+# d'environnement THRESHOLD_SECONDS, EURKM_MIN, etc. ne servent plus que de valeurs par
+# défaut pour un chauffeur qui n'a rien modifié.
+EXPIRE_SECONDS = int(os.environ.get("EXPIRE_SECONDS", 15 * 60))   # défaut de la fenêtre de dédup
 # Fenêtre de déduplication inter-groupes : une même course repostée dans un autre groupe
 # sous ce délai n'est notifiée qu'une fois (évite doubles alertes / doubles réponses).
 DEDUP_WINDOW_SECONDS = int(os.environ.get("DEDUP_WINDOW_SECONDS", str(EXPIRE_SECONDS)))
@@ -120,20 +120,19 @@ GEO_VIEWBOX = os.environ.get("GEO_VIEWBOX", "").strip()
 USER_AGENT  = os.environ.get("USER_AGENT", "vtc-bridge/1.0 (contact: you@example.com)")
 
 STATE_DIR = os.environ.get("STATE_DIR", "state")
-POS_FILE  = os.path.join(STATE_DIR, "position.json")
 COURSES_DB = os.path.join(STATE_DIR, "courses.db")
+SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")      # sessions Telethon des chauffeurs ajoutés
 os.makedirs(STATE_DIR, exist_ok=True)
 
-# Part reversée à l'apporteur, en fraction (0.15 = 15%). Sert au calcul commission/net
-# quand le message ne précise rien. Une commission explicite dans la course la remplace.
-COMMISSION_RATE = float(os.environ.get("COMMISSION_RATE", "0") or "0")
 # Agenda macOS (synchronisé iCloud -> iPhone) où ajouter les réservations obtenues.
+# Réservé au chauffeur « propriétaire » : l'agenda est celui de la machine du serveur.
 CALENDAR_NAME = os.environ.get("CALENDAR_NAME", "Calendrier").strip()
 
-# Boutons inline : bot DÉDIÉ (≠ bot Hermès) + ton id Telegram (DM des alertes).
-# Si BOT_TOKEN vide -> fallback : alertes texte dans le relais pour Hermès (comportement historique).
+# Boutons inline : bot DÉDIÉ (≠ bot Hermès), partagé par tous les chauffeurs ; chaque alerte
+# part en DM vers le chauffeur concerné (son id Telegram = son chat avec le bot).
+# Si BOT_TOKEN vide -> fallback : alertes texte dans le relais du chauffeur pour Hermès.
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "").strip()
-NOTIFY_USER_ID = int(os.environ.get("NOTIFY_USER_ID", "0") or "0")
+NOTIFY_USER_ID = int(os.environ.get("NOTIFY_USER_ID", "0") or "0")   # chauffeur d'origine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,17 +142,45 @@ logging.basicConfig(
 log = logging.getLogger("vtc")
 logging.getLogger("fontTools").setLevel(logging.ERROR)   # PDF : coupe le bruit du sous-échantillonnage
 
-client = TelegramClient(SESSION, API_ID, API_HASH)          # session utilisateur (lit les groupes, poste les réponses)
 bot = TelegramClient("vtc_bot", API_ID, API_HASH) if BOT_TOKEN else None  # bot dédié aux boutons
-_seen_courses: set[tuple[int, int]] = set()   # dédup (groupe, message id) : ne traite pas 2× le même message
-_pending_alerts: dict[int, int] = {}          # id message alerte DM -> id course en base (alertes encore actives)
-_alert_ctx: dict[int, dict] = {}              # id message alerte DM -> contexte (texte, départ, ETA) pour « Accepter »
-_dup_seen: dict[str, float] = {}              # empreinte de course -> ts : dédup inter-groupes (même course, autre groupe)
 GROUP_NAMES: dict[int, str] = {}              # id groupe -> nom lisible (résolu au démarrage)
 BOT_SELF_ID: int = 0                           # id du bot (pour ne pas doubler /note dans son DM)
-CLIENT_SELF_ID: int = 0                         # id de TON compte (= tes Messages sauvegardés)
-_pending_note: dict[int, str] = {}            # id message sélecteur -> texte de note en attente de course
-_awaiting: dict[int, tuple] = {}              # id user -> (id course, champ) : prochain message = édition (note/prix/comm)
+
+
+class DriverRT:
+    """État d'exécution d'UN chauffeur. Rien de ce qui touche une alerte, une position, un
+    déduplicateur ou une saisie en attente n'est global : tout vit ici, par chauffeur.
+    Les ids de messages du bot se répètent d'un chat à l'autre, donc les tables d'alertes
+    ne peuvent pas être partagées."""
+
+    def __init__(self, profile: "D.Profile"):
+        self.p = profile
+        self.client: "TelegramClient | None" = None
+        self.self_id = 0                              # id du compte lu par la session (garde-fou)
+        self.seen_courses: set[tuple[int, int]] = set()   # (groupe, message) déjà traités
+        self.pending_alerts: dict[int, int] = {}      # id message alerte DM -> id course (actives)
+        self.alert_ctx: dict[int, dict] = {}          # id message alerte DM -> contexte « Accepter »
+        self.dup_seen: dict[str, float] = {}          # empreinte -> ts : dédup inter-groupes
+        self.pending_note: dict[int, str] = {}        # id message sélecteur -> note en attente
+        self.awaiting: "tuple | None" = None          # (id course, champ) : prochain message = saisie
+        self.last_pos_warn = 0.0
+        self.pos_expiry_task = None
+        self.runner = None                            # tâche run_until_disconnected
+
+    @property
+    def id(self) -> int:
+        return self.p.id
+
+    @property
+    def tag(self) -> str:                             # préfixe de log lisible
+        return f"[{self.p.name or self.p.id}]"
+
+    def cfg(self, key: str):
+        """Réglage effectif de ce chauffeur (sa valeur, sinon le défaut)."""
+        return self.p.get(key)
+
+
+DRIVERS: dict[int, DriverRT] = {}                 # id Telegram -> chauffeur connecté
 
 
 def group_name(gid: int) -> str:
@@ -161,21 +188,25 @@ def group_name(gid: int) -> str:
 
 
 # ─────────────────────── Position live ────────────────────────
-def save_position(lat: float, lon: float) -> None:
-    with open(POS_FILE, "w") as f:
+def pos_path(driver_id: int) -> str:
+    return os.path.join(STATE_DIR, f"position_{driver_id}.json")
+
+
+def save_position(drv: DriverRT, lat: float, lon: float) -> None:
+    with open(pos_path(drv.id), "w") as f:
         json.dump({"lat": lat, "lon": lon, "ts": time.time()}, f)
-    log.info("Position mise à jour : %.5f, %.5f", lat, lon)
+    log.info("%s Position mise à jour : %.5f, %.5f", drv.tag, lat, lon)
 
 
-def load_position() -> dict | None:
+def load_position(drv: DriverRT) -> dict | None:
     try:
-        with open(POS_FILE) as f:
+        with open(pos_path(drv.id)) as f:
             pos = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
     if time.time() - pos["ts"] > POSITION_STALE_SECONDS:
-        log.warning("Position périmée (%.0fs) — partage-tu bien ta position en direct ?",
-                    time.time() - pos["ts"])
+        log.warning("%s Position périmée (%.0fs) — partage-t-il bien sa position en direct ?",
+                    drv.tag, time.time() - pos["ts"])
         return None
     return pos
 
@@ -426,9 +457,10 @@ _COMM_ABS  = re.compile(r"comm\w*[^\d]{0,8}(\d{1,3})(?:\s*€|\s*e\b|\b)", re.I)
 _NET_RE    = re.compile(r"\bnet\b", re.I)
 
 
-def commission_for(text: str, price: "float | None") -> "tuple[float, float | None]":
+def commission_for(text: str, price: "float | None",
+                   default_rate: float = 0.0) -> "tuple[float, float | None]":
     """(commission €, taux) pour une course. Priorité : commission explicite du message,
-    puis 'net' (= 0), puis le taux par défaut COMMISSION_RATE."""
+    puis 'net' (= 0), puis `default_rate` (le taux réglé par le chauffeur, en fraction)."""
     if price is None:
         return 0.0, None
     m = _COMM_PCT.search(text) or _COMM_PCT2.search(text)
@@ -442,8 +474,8 @@ def commission_for(text: str, price: "float | None") -> "tuple[float, float | No
             return c, round(c / price, 3)
     if _NET_RE.search(text):                    # prix annoncé "net" -> pas de commission à déduire
         return 0.0, 0.0
-    if COMMISSION_RATE:
-        return round(price * COMMISSION_RATE, 2), COMMISSION_RATE
+    if default_rate:
+        return round(price * default_rate, 2), default_rate
     return 0.0, None
 
 
@@ -475,23 +507,63 @@ def extract_dropoff(text: str) -> "str | None":
 
 
 # ─────────────────────── Géocodage / ETA ──────────────────────
+# Géocodage partagé par tous les chauffeurs : la même course tombe chez N chauffeurs au
+# même instant. Un cache évite N appels identiques, et un verrou unique garde la cadence
+# de Nominatim (~1 requête/s pour l'ensemble du service, pas par chauffeur).
+_GEO_CACHE: dict[str, tuple[float, "tuple[float, float, str] | None"]] = {}
+_GEO_TTL_HIT = 6 * 3600           # une adresse trouvée ne bouge pas
+_GEO_TTL_MISS = 600               # un « introuvable » se retente au bout de 10 min
+_GEO_MAX = 4000
+_GEO_LOCK = asyncio.Lock()
+_geo_last = 0.0
+
+
+def _geo_cached(key: str):
+    hit = _GEO_CACHE.get(key)
+    if hit is None:
+        return False, None
+    ts, val = hit
+    if time.time() - ts > (_GEO_TTL_HIT if val else _GEO_TTL_MISS):
+        _GEO_CACHE.pop(key, None)
+        return False, None
+    return True, val
+
+
 async def geocode(session: aiohttp.ClientSession, query: str) -> tuple[float, float, str] | None:
-    params = {"q": query, "format": "jsonv2", "limit": "1", "addressdetails": "0"}
-    if GEO_VIEWBOX:
-        params["viewbox"] = GEO_VIEWBOX
-        params["bounded"] = "1"
-    try:
-        async with session.get(f"{NOMINATIM_URL}/search", params=params,
-                               headers={"User-Agent": USER_AGENT}) as r:
-            r.raise_for_status()
-            data = await r.json()
-    except Exception as e:                       # noqa: BLE001
-        log.warning("Nominatim KO pour %r : %s", query, e)
-        return None
-    if not data:
-        return None
-    hit = data[0]
-    return float(hit["lat"]), float(hit["lon"]), hit.get("display_name", query)
+    global _geo_last
+    key = " ".join(query.lower().split())
+    found, val = _geo_cached(key)
+    if found:
+        return val
+    async with _GEO_LOCK:
+        found, val = _geo_cached(key)              # un autre chauffeur l'a peut-être résolu entre-temps
+        if found:
+            return val
+        wait = 1.1 - (time.monotonic() - _geo_last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        params = {"q": query, "format": "jsonv2", "limit": "1", "addressdetails": "0"}
+        if GEO_VIEWBOX:
+            params["viewbox"] = GEO_VIEWBOX
+            params["bounded"] = "1"
+        try:
+            async with session.get(f"{NOMINATIM_URL}/search", params=params,
+                                   headers={"User-Agent": USER_AGENT}) as r:
+                r.raise_for_status()
+                data = await r.json()
+        except Exception as e:                       # noqa: BLE001
+            log.warning("Nominatim KO pour %r : %s", query, e)
+            return None                              # erreur réseau : on ne met rien en cache
+        finally:
+            _geo_last = time.monotonic()
+        result = None
+        if data:
+            hit = data[0]
+            result = float(hit["lat"]), float(hit["lon"]), hit.get("display_name", query)
+        if len(_GEO_CACHE) >= _GEO_MAX:
+            _GEO_CACHE.pop(next(iter(_GEO_CACHE)), None)
+        _GEO_CACHE[key] = (time.time(), result)
+        return result
 
 
 async def route_eta(session: aiohttp.ClientSession, src: dict, dst: tuple[float, float],
@@ -567,13 +639,20 @@ def trip_line(depart: str, arrivee: str) -> str:
             f"🏁 <b>{html.escape(_short_loc(arrivee))}</b>")
 
 
-def rentability_dot(eurkm) -> str:
-    """🟢 rentable · 🟠 moyen · 🔴 peu rentable · ⚪ inconnu."""
+def _good_mid(p: "D.Profile") -> "tuple[float, float]":
+    """Seuils de couleur du chauffeur : vert dès « rentable », orange dès son €/km minimum."""
+    mid = float(p.get("eurkm_min"))
+    return max(float(p.get("eurkm_good")), mid), mid
+
+
+def rentability_dot(eurkm, p: "D.Profile") -> str:
+    """🟢 rentable · 🟠 moyen · 🔴 peu rentable · ⚪ inconnu (seuils propres au chauffeur)."""
     if eurkm is None:
         return "⚪"
-    if eurkm >= EURKM_GOOD:
+    good, mid = _good_mid(p)
+    if eurkm >= good:
         return "🟢"
-    if eurkm >= EURKM_MID:
+    if eurkm >= mid:
         return "🟠"
     return "🔴"
 
@@ -668,9 +747,9 @@ def build_ics(summary: str, dt, description: str = "", location: str = "") -> st
     ])
 
 
-def metrics_header(eurkm, price, dur_min, dep_time: str) -> str:
+def metrics_header(eurkm, price, dur_min, dep_time: str, p: "D.Profile") -> str:
     """Ligne compacte en tête : rentabilité (couleur) · prix · durée · heure."""
-    parts = [rentability_dot(eurkm) + (f" {eurkm:.2f} €/km" if eurkm is not None else "")]
+    parts = [rentability_dot(eurkm, p) + (f" {eurkm:.2f} €/km" if eurkm is not None else "")]
     if price:
         parts.append(f"💶 {price:.0f}€")
     if dur_min:
@@ -685,12 +764,13 @@ HR = "─────────────"
 MID = "  ·  "
 
 
-def rentability_line(eurkm) -> str:
+def rentability_line(eurkm, p: "D.Profile") -> str:
     """Ligne de décision mise en avant : pastille + €/km en gras + niveau."""
-    dot = rentability_dot(eurkm)
+    dot = rentability_dot(eurkm, p)
     if eurkm is None:
         return f"{dot}  <i>rentabilité à confirmer</i>"
-    tier = "rentable" if eurkm >= EURKM_GOOD else ("correct" if eurkm >= EURKM_MID else "peu rentable")
+    good, mid = _good_mid(p)
+    tier = "rentable" if eurkm >= good else ("correct" if eurkm >= mid else "peu rentable")
     return f"{dot}  <b>{eurkm:.1f} €/km</b>{MID}{tier}"
 
 
@@ -713,7 +793,6 @@ async def _geo_route(session, from_coords, to_text: str):
     if not to_text:
         return None
     g = await geocode(session, to_text)
-    await asyncio.sleep(1.1)
     if not g:
         return None
     rt = await route_eta(session, {"lat": from_coords[0], "lon": from_coords[1]}, (g[0], g[1]))
@@ -722,29 +801,36 @@ async def _geo_route(session, from_coords, to_text: str):
     return rt[1] / 1000, rt[0] / 60
 
 
-async def _expire_alert(msg_id: int) -> None:
-    """Passé EXPIRE_SECONDS sans réponse, neutralise l'alerte."""
-    await asyncio.sleep(EXPIRE_SECONDS)
-    _alert_ctx.pop(msg_id, None)
-    cid = _pending_alerts.pop(msg_id, None)
+async def _expire_alert(drv: DriverRT, msg_id: int) -> None:
+    """Passé le délai réglé par le chauffeur sans réponse, neutralise l'alerte."""
+    minutes = drv.cfg("expire_min")
+    await asyncio.sleep(minutes * 60)
+    drv.alert_ctx.pop(msg_id, None)
+    cid = drv.pending_alerts.pop(msg_id, None)
     if cid is None:                            # déjà répondue / passée
         return
-    store.set_status(cid, "expirée")
+    store.set_status(cid, "expirée", drv.id)
     try:
         await bot.edit_message(
-            NOTIFY_USER_ID, msg_id,
-            f"⏱️ <b>Course expirée</b>{MID}<i>sans réponse en {EXPIRE_SECONDS // 60} min</i>",
+            drv.id, msg_id,
+            f"⏱️ <b>Course expirée</b>{MID}<i>sans réponse en {minutes} min</i>",
             buttons=None, parse_mode="html")
     except Exception:                          # noqa: BLE001
         pass
 
 
-def time_options(eta_s: float) -> "tuple[str, list[str]]":
+def time_options(eta_s: float, sp_under_min: "float | None" = None,
+                 choices: "int | None" = None) -> "tuple[str, list[str]]":
     """Temps à annoncer pour rejoindre le départ : (meilleur, choix proposés).
     Le meilleur = le plus petit délai réellement tenable (ETA arrondie à la minute
-    supérieure, « SP » sous SP_UNDER_SECONDS) : annoncer moins = arriver en retard,
-    annoncer plus = se faire doubler. Les autres choix = paliers de 5 min au-dessus."""
-    if eta_s < SP_UNDER_SECONDS:
+    supérieure, « SP » sous `sp_under_min`) : annoncer moins = arriver en retard,
+    annoncer plus = se faire doubler. Les autres choix = paliers de 5 min au-dessus.
+    Les deux seuils sont des réglages du chauffeur ; sans argument : les défauts."""
+    if sp_under_min is None:
+        sp_under_min = D.SETTINGS_BY_KEY["sp_under_min"].default
+    if choices is None:
+        choices = D.SETTINGS_BY_KEY["time_choices"].default
+    if eta_s < sp_under_min * 60:
         best = "SP"
         base = 0                               # SP, puis 5, 10…
     else:
@@ -752,10 +838,14 @@ def time_options(eta_s: float) -> "tuple[str, list[str]]":
         base = int(best)
     opts = [best]
     step = (base // 5 + 1) * 5                 # palier de 5 strictement au-dessus
-    while len(opts) < max(1, TIME_CHOICES):
+    while len(opts) < max(1, choices):
         opts.append(str(step))
         step += 5
     return best, opts
+
+
+def driver_time_options(drv: DriverRT, eta_s: float) -> "tuple[str, list[str]]":
+    return time_options(eta_s, drv.cfg("sp_under_min"), drv.cfg("time_choices"))
 
 
 def _decision_rows(gid: int, mid: int) -> list:
@@ -768,29 +858,32 @@ def _decision_rows(gid: int, mid: int) -> list:
     return rows
 
 
-async def deliver_alert(dm_body: str, feed_body: str, reply: str, gid: int, mid: int,
-                        course: "dict | None" = None, pickup_coords=None,
+async def deliver_alert(drv: DriverRT, dm_body: str, feed_body: str, reply: str, gid: int,
+                        mid: int, course: "dict | None" = None, pickup_coords=None,
                         eta_s: "float | None" = None) -> None:
-    """Bot configuré -> DM propre (HTML) + boutons Accepter / Refuser. Sinon -> texte technique
-    dans le relais (Hermès). Si `course` est fourni, la course est journalisée (statut « proposée »).
-    `pickup_coords` / `eta_s` servent à recalculer le temps depuis ta position au moment d'accepter."""
-    if bot and NOTIFY_USER_ID:
-        sent = await bot.send_message(NOTIFY_USER_ID, dm_body, buttons=_decision_rows(gid, mid),
+    """Bot configuré -> DM propre (HTML) vers CE chauffeur + boutons Accepter / Refuser.
+    Sinon -> texte technique dans son relais (Hermès). Si `course` est fourni, la course est
+    journalisée (statut « proposée »). `pickup_coords` / `eta_s` servent à recalculer le temps
+    depuis sa position au moment d'accepter."""
+    if bot:
+        sent = await bot.send_message(drv.id, dm_body, buttons=_decision_rows(gid, mid),
                                       parse_mode="html", link_preview=False)
         if course is not None:
-            cid = store.record_course(alert_id=sent.id, reply=reply, **course)
-            _pending_alerts[sent.id] = cid
-        _alert_ctx[sent.id] = dict(body=dm_body, reply=reply, pickup=pickup_coords, eta_s=eta_s)
-        asyncio.create_task(_expire_alert(sent.id))
-    else:
+            cid = store.record_course(driver_id=drv.id, alert_id=sent.id, reply=reply, **course)
+            drv.pending_alerts[sent.id] = cid
+        drv.alert_ctx[sent.id] = dict(body=dm_body, reply=reply, pickup=pickup_coords, eta_s=eta_s)
+        asyncio.create_task(_expire_alert(drv, sent.id))
+    elif drv.p.feed_group and drv.client:
         body = feed_body + (f"\n{BOT_MENTION}" if BOT_MENTION else "")
-        await client.send_message(FEED_GROUP, body)
+        await drv.client.send_message(drv.p.feed_group, body)
+    else:
+        log.warning("%s Alerte perdue : ni bot ni relais configuré.", drv.tag)
 
 
-async def _fresh_eta(ctx: dict) -> "tuple[float, float | None, bool] | None":
-    """ETA vers le départ depuis ta position ACTUELLE : (secondes, mètres, à_jour).
+async def _fresh_eta(drv: DriverRT, ctx: dict) -> "tuple[float, float | None, bool] | None":
+    """ETA vers le départ depuis sa position ACTUELLE : (secondes, mètres, à_jour).
     Repli sur l'ETA calculée à l'arrivée de l'alerte si la position ou le routage manque."""
-    src = load_position()
+    src = load_position(drv)
     if ctx.get("pickup") and src is not None:
         async with aiohttp.ClientSession() as session:
             rt = await route_eta(session, src, ctx["pickup"])
@@ -801,11 +894,11 @@ async def _fresh_eta(ctx: dict) -> "tuple[float, float | None, bool] | None":
     return None
 
 
-async def escalate(session, text_original: str, dep_text: str, pickup_coords,
+async def escalate(drv: DriverRT, session, text_original: str, dep_text: str, pickup_coords,
                    eta_s: float, dist_m: float, gid: int, mid: int) -> None:
     prox = round(eta_s / 60)                        # temps pour rejoindre le départ
     # Règle de réponse VTC : < 5 min -> "SP" (sur place), sinon le délai en minutes
-    reply = time_options(eta_s)[0]
+    reply = driver_time_options(drv, eta_s)[0]
     link = course_link(gid, mid)
     price = extract_price(text_original)
     arr_text = extract_dropoff(text_original)
@@ -813,16 +906,16 @@ async def escalate(session, text_original: str, dep_text: str, pickup_coords,
     trip_km = trip[0] if trip else None
     dur_min = trip[1] if trip else None
     eurkm = (price / trip_km) if (price and trip_km) else None
-    commission, comm_rate = commission_for(text_original, price)
+    commission, comm_rate = commission_for(text_original, price, drv.p.commission_rate)
     net = (price - commission) if price is not None else None
-    header = metrics_header(eurkm, price, dur_min, depart_time(text_original))
+    header = metrics_header(eurkm, price, dur_min, depart_time(text_original), drv.p)
     dm_body = (
         f"🚕 <b>Course proche</b>\n"
         f"{HR}\n"
         f"📍 <b>{html.escape(_short_loc(dep_text))}</b>\n"
         f"🏁 <b>{html.escape(_short_loc(arr_text))}</b>\n\n"
         f"🚗 <b>{prox} min</b> de toi{MID}{dist_m/1000:.1f} km\n"
-        f"{rentability_line(eurkm)}\n"
+        f"{rentability_line(eurkm, drv.p)}\n"
         f"{pretty_metrics(price, trip_km, dur_min, depart_time(text_original))}\n\n"
         f"<blockquote expandable>{html.escape(text_original)}</blockquote>"
     )
@@ -841,34 +934,30 @@ async def escalate(session, text_original: str, dep_text: str, pickup_coords,
         + f"[GID {gid}]\n──────────\n{text_original}\n──────────\n"
         f"→ Hermès : propose d'envoyer « {reply} » (valide avant envoi)."
     )
-    await deliver_alert(dm_body, feed_body, reply, gid, mid, course,
+    await deliver_alert(drv, dm_body, feed_body, reply, gid, mid, course,
                         pickup_coords=pickup_coords, eta_s=eta_s)
-    log.info("Course proche escaladée (à %s min | PEC=%r | brut=%r).",
-             prox, dep_text, text_original[:70].replace("\n", " "))
+    log.info("%s Course proche escaladée (à %s min | PEC=%r | brut=%r).",
+             drv.tag, prox, dep_text, text_original[:70].replace("\n", " "))
 
 
-_last_pos_warn = 0.0
-_pos_expiry_task = None
-
-
-def schedule_live_expiry(period: int) -> None:
+def schedule_live_expiry(drv: DriverRT, period: int) -> None:
     """Programme un rappel LIVE_REMIND_BEFORE avant la fin d'un partage de position en direct."""
-    global _pos_expiry_task
-    if _pos_expiry_task and not _pos_expiry_task.done():
-        _pos_expiry_task.cancel()
-    _pos_expiry_task = asyncio.create_task(_live_expiry_reminder(max(0, period - LIVE_REMIND_BEFORE)))
+    if drv.pos_expiry_task and not drv.pos_expiry_task.done():
+        drv.pos_expiry_task.cancel()
+    drv.pos_expiry_task = asyncio.create_task(
+        _live_expiry_reminder(drv, max(0, period - LIVE_REMIND_BEFORE)))
 
 
-async def _live_expiry_reminder(delay: float) -> None:
+async def _live_expiry_reminder(drv: DriverRT, delay: float) -> None:
     try:
         await asyncio.sleep(delay)
     except asyncio.CancelledError:
         return
-    if not (bot and NOTIFY_USER_ID):
+    if not bot:
         return
     try:
         await bot.send_message(
-            NOTIFY_USER_ID,
+            drv.id,
             "⏰ <b>Ta position expire bientôt</b>\n"
             f"{HR}\n"
             "Relance le partage en direct pour rester couvert sans interruption :\n"
@@ -884,13 +973,16 @@ async def _reservation_reminder_loop() -> None:
     await asyncio.sleep(30)
     while True:
         try:
-            if bot and NOTIFY_USER_ID:
+            if bot:
                 for r in store.due_reservations(time.time() - RESA_PROMPT_AFTER):
-                    store.set_prompted(r["id"])
+                    drv = DRIVERS.get(r["driver_id"])
+                    if drv is None:                  # chauffeur déconnecté : on redemandera à son retour
+                        continue
+                    store.set_prompted(r["id"], drv.id)
                     rows = [[Button.inline("✅ Effectuée", f"eff|{r['id']}|1".encode()),
                              Button.inline("❌ Annulée", f"eff|{r['id']}|0".encode())]]
                     await bot.send_message(
-                        NOTIFY_USER_ID,
+                        drv.id,
                         f"📅 <b>Réservation — effectuée ?</b>\n{HR}\n{_recap_line(r)}\n\n"
                         f"<i>L'heure est passée. Valide pour compter le paiement.</i>",
                         buttons=rows, parse_mode="html")
@@ -900,39 +992,41 @@ async def _reservation_reminder_loop() -> None:
 
 
 async def _daily_summary_loop() -> None:
-    """Envoie une fois par jour, vers DAILY_SUMMARY_HOUR, le récap des dernières 24 h
-    (seulement s'il y a eu des courses réalisées ou des frais)."""
+    """Envoie à chaque chauffeur, une fois par jour, vers DAILY_SUMMARY_HOUR, le récap de
+    ses dernières 24 h (seulement s'il y a eu des courses réalisées ou des frais)."""
     if DAILY_SUMMARY_HOUR is None:
         return
     await asyncio.sleep(60)
     while True:
-        try:
-            if bot and NOTIFY_USER_ID:
-                now = _dt.datetime.now()
-                today = now.date().isoformat()
-                if now.hour == DAILY_SUMMARY_HOUR and store.get_setting("last_daily") != today:
-                    store.set_setting("last_daily", today)            # une seule fois par jour
-                    s = store.summary("24h")
+        now = _dt.datetime.now()
+        today = now.date().isoformat()
+        if bot and now.hour == DAILY_SUMMARY_HOUR:
+            for drv in list(DRIVERS.values()):
+                try:
+                    if store.get_setting(drv.id, "last_daily") == today:
+                        continue
+                    store.set_setting(drv.id, "last_daily", today)    # une seule fois par jour
+                    s = store.summary(drv.id, "24h")
                     if s["done"] or s.get("frais"):                  # pas de spam les jours sans activité
                         await bot.send_message(
-                            NOTIFY_USER_ID,
-                            "🌙 <b>Bonne fin de service — voici ta journée.</b>\n\n" + build_report("24h"),
+                            drv.id,
+                            "🌙 <b>Bonne fin de service — voici ta journée.</b>\n\n"
+                            + build_report(drv, "24h"),
                             parse_mode="html", link_preview=False)
-        except Exception as e:                       # noqa: BLE001
-            log.warning("Bilan auto KO : %s", e)
+                except Exception as e:                       # noqa: BLE001
+                    log.warning("%s Bilan auto KO : %s", drv.tag, e)
         await asyncio.sleep(600)
 
 
-async def warn_position() -> None:
-    """Rappel throttlé (max 1 / 10 min) quand ta position n'est plus partagée."""
-    global _last_pos_warn
+async def warn_position(drv: DriverRT) -> None:
+    """Rappel throttlé (max 1 / 10 min par chauffeur) quand sa position n'est plus partagée."""
     now = time.time()
-    if now - _last_pos_warn < 600 or not (bot and NOTIFY_USER_ID):
+    if now - drv.last_pos_warn < 600 or not bot:
         return
-    _last_pos_warn = now
+    drv.last_pos_warn = now
     try:
         await bot.send_message(
-            NOTIFY_USER_ID,
+            drv.id,
             "📍 <b>Position introuvable</b>\n"
             f"{HR}\n"
             "Je ne reçois plus ta position — impossible de repérer les courses proches.\n\n"
@@ -943,30 +1037,31 @@ async def warn_position() -> None:
         pass
 
 
-async def escalate_raw(text_original: str, src: dict | None, reason: str,
+async def escalate_raw(drv: DriverRT, text_original: str, src: dict | None, reason: str,
                        gid: int, mid: int = 0) -> None:
     """Course non exploitable (non géocodée…) : on la LOGGE sans notifier (zéro bruit).
     Les alertes ne partent que pour les courses réellement jugées proches / rentables."""
-    log.info("Course à confirmer (%s) | gid %s | brut=%r",
-             reason, gid, text_original[:80].replace("\n", " "))
+    log.info("%s Course à confirmer (%s) | gid %s | brut=%r",
+             drv.tag, reason, gid, text_original[:80].replace("\n", " "))
 
 
-async def escalate_resa(text_original: str, price: float, km: float, eurkm: float,
-                        dur_min, gid: int, mid: int) -> None:
-    """Réservation rentable (>= EURKM_MIN €/km)."""
+async def escalate_resa(drv: DriverRT, text_original: str, price: float, km: float,
+                        eurkm: float, dur_min, gid: int, mid: int) -> None:
+    """Réservation qui passe les réglages du chauffeur (prix, €/km, rayon)."""
     link = course_link(gid, mid)
+    resa_reply = drv.cfg("resa_reply")
     deps = extract_pickup(text_original)
     depart = deps[0] if deps else "?"
     arrivee = extract_dropoff(text_original)
-    commission, comm_rate = commission_for(text_original, price)
+    commission, comm_rate = commission_for(text_original, price, drv.p.commission_rate)
     net = (price - commission) if price is not None else None
-    header = metrics_header(eurkm, price, dur_min, depart_time(text_original))
+    header = metrics_header(eurkm, price, dur_min, depart_time(text_original), drv.p)
     dm_body = (
         f"📅 <b>Réservation</b>\n"
         f"{HR}\n"
         f"📍 <b>{html.escape(_short_loc(depart))}</b>\n"
         f"🏁 <b>{html.escape(_short_loc(arrivee))}</b>\n\n"
-        f"{rentability_line(eurkm)}\n"
+        f"{rentability_line(eurkm, drv.p)}\n"
         f"{pretty_metrics(price, km, dur_min, depart_time(text_original))}\n\n"
         f"<blockquote expandable>{html.escape(text_original)}</blockquote>"
     )
@@ -979,51 +1074,91 @@ async def escalate_resa(text_original: str, price: float, km: float, eurkm: floa
         f"{header}\n"
         f"📍 {_short_loc(depart)}\n"
         f"🏁 {_short_loc(arrivee)}\n"
-        f"💬 Réponse suggérée : {RESA_REPLY}\n"
+        f"💬 Réponse suggérée : {resa_reply}\n"
         + (f"🔗 {link}\n" if link else "")
         + f"[GID {gid}]\n──────────\n{text_original}\n──────────\n"
-        f"→ Hermès : réservation rentable, propose « {RESA_REPLY} »."
+        f"→ Hermès : réservation rentable, propose « {resa_reply} »."
     )
-    await deliver_alert(dm_body, feed_body, RESA_REPLY, gid, mid, course)
-    log.info("Réservation escaladée (%.2f €/km, gid %s).", eurkm, gid)
+    await deliver_alert(drv, dm_body, feed_body, resa_reply, gid, mid, course)
+    log.info("%s Réservation escaladée (%.2f €/km, gid %s).", drv.tag, eurkm, gid)
 
 
-async def handle_reservation(text: str, gid: int, mid: int) -> None:
-    """Réservation : notifie si le tarif est >= EURKM_MIN €/km (proximité ignorée)."""
+# Trajet d'une réservation (départ -> arrivée) : identique pour tous les chauffeurs, donc
+# calculé une fois. Évite N appels de routage (quota HERE) pour la même réservation.
+_RESA_ROUTE_CACHE: dict[tuple, tuple[float, "tuple[float, float] | None"]] = {}
+_RESA_ROUTE_TTL = 3600
+
+
+async def _resa_route(session, g1, g2, when_hour):
+    key = (round(g1[0], 4), round(g1[1], 4), round(g2[0], 4), round(g2[1], 4), when_hour)
+    hit = _RESA_ROUTE_CACHE.get(key)
+    if hit and time.time() - hit[0] < _RESA_ROUTE_TTL:
+        return hit[1]
+    rt = await route_eta(session, {"lat": g1[0], "lon": g1[1]}, (g2[0], g2[1]), when_hour=when_hour)
+    if rt:                                           # un échec réseau ne se met pas en cache
+        if len(_RESA_ROUTE_CACHE) > 2000:
+            _RESA_ROUTE_CACHE.clear()
+        _RESA_ROUTE_CACHE[key] = (time.time(), rt)
+    return rt
+
+
+async def _resa_pickup_km(drv: DriverRT, session, dep: "str | None") -> "float | None":
+    """Distance à vol d'oiseau entre la dernière position du chauffeur et le départ de la
+    réservation. None si on ne sait pas (position périmée, départ introuvable)."""
+    src = load_position(drv)
+    if src is None or not dep:
+        return None
+    g = await geocode(session, dep)
+    if not g:
+        return None
+    return D.haversine_km(src["lat"], src["lon"], g[0], g[1])
+
+
+async def handle_reservation(drv: DriverRT, text: str, gid: int, mid: int) -> None:
+    """Réservation : le tarif au km décide, borné par les réglages du chauffeur (prix
+    minimum, €/km minimum, rayon autour de sa position)."""
     price = extract_price(text)
     if price is None:
         return                                       # pas de prix lisible -> on ne peut pas juger
-    km = extract_km(text)                            # km explicite dans le message ?
-    dur_min = None
-    if km is None:                                   # sinon on géocode dep->arr et on route
-        deps = extract_pickup(text)
-        dep = deps[0] if deps else None
-        arr = extract_dropoff(text)
-        if not dep or not arr:
-            await escalate_raw(text, load_position(), "réservation : trajet incomplet", gid, mid)
-            return
-        async with aiohttp.ClientSession() as s:
+    ok, why = D.accept_resa_price(drv.p, price=price)
+    if not ok:
+        log.info("%s Réservation ignorée : %s.", drv.tag, why)
+        return
+    deps = extract_pickup(text)
+    dep = deps[0] if deps else None
+    async with aiohttp.ClientSession() as s:
+        # Rayon (si le chauffeur en a réglé un) : filtre bon marché, avant tout routage.
+        if drv.cfg("resa_radius_km"):
+            ok, why = D.accept_resa_radius(drv.p, pickup_km=await _resa_pickup_km(drv, s, dep))
+            if not ok:
+                log.info("%s Réservation ignorée : %s.", drv.tag, why)
+                return
+        km = extract_km(text)                        # km explicite dans le message ?
+        dur_min = None
+        if km is None:                               # sinon on géocode dep->arr et on route
+            arr = extract_dropoff(text)
+            if not dep or not arr:
+                await escalate_raw(drv, text, load_position(drv), "réservation : trajet incomplet", gid, mid)
+                return
             g1 = await geocode(s, dep)
-            await asyncio.sleep(1.1)
             g2 = await geocode(s, arr)
-            await asyncio.sleep(1.1)
             if not g1 or not g2:
-                await escalate_raw(text, load_position(), "réservation : géocodage trajet KO", gid, mid)
+                await escalate_raw(drv, text, load_position(drv), "réservation : géocodage trajet KO", gid, mid)
                 return
             # trafic estimé à l'HEURE PRÉVUE de la réservation (pas maintenant)
-            rt = await route_eta(s, {"lat": g1[0], "lon": g1[1]}, (g2[0], g2[1]),
-                                 when_hour=depart_hour(text))
-        if not rt:
-            return
-        km = rt[1] / 1000
-        dur_min = rt[0] / 60
+            rt = await _resa_route(s, g1, g2, depart_hour(text))
+            if not rt:
+                return
+            km = rt[1] / 1000
+            dur_min = rt[0] / 60
     if km < 0.5:
         return
     eurkm = price / km
-    if eurkm >= EURKM_MIN:
-        await escalate_resa(text, price, km, eurkm, dur_min, gid, mid)
+    ok, why = D.accept_resa_rate(drv.p, eurkm=eurkm)
+    if ok:
+        await escalate_resa(drv, text, price, km, eurkm, dur_min, gid, mid)
     else:
-        log.info("Réservation ignorée : %.2f €/km (< %.2f).", eurkm, EURKM_MIN)
+        log.info("%s Réservation ignorée : %s.", drv.tag, why)
 
 
 # ───────────── Déduplication inter-groupes ─────────────
@@ -1067,19 +1202,20 @@ def course_text_fingerprint(text: str) -> "str | None":
     return "txt|" + flat
 
 
-def is_duplicate_course(fp: "str | None", window: "float | None" = None) -> bool:
-    """True si cette empreinte a déjà été vue dans la fenêtre (repost inter-groupes)."""
+def is_duplicate_course(drv: DriverRT, fp: "str | None", window: "float | None" = None) -> bool:
+    """True si CE chauffeur a déjà vu cette empreinte dans la fenêtre (repost inter-groupes).
+    La mémoire est par chauffeur : un repost qu'un chauffeur a filtré ne masque rien aux autres."""
     if not fp:
         return False
     if window is None:
         window = DEDUP_WINDOW_SECONDS
     now = time.time()
     horizon = max(DEDUP_WINDOW_SECONDS, DEDUP_TEXT_WINDOW_SECONDS)
-    for k, ts in list(_dup_seen.items()):        # purge -> borne la mémoire
+    for k, ts in list(drv.dup_seen.items()):     # purge -> borne la mémoire
         if now - ts > horizon:
-            del _dup_seen[k]
-    already = fp in _dup_seen and now - _dup_seen[fp] <= window
-    _dup_seen[fp] = now                            # (ré)arme la fenêtre glissante
+            del drv.dup_seen[k]
+    already = fp in drv.dup_seen and now - drv.dup_seen[fp] <= window
+    drv.dup_seen[fp] = now                         # (ré)arme la fenêtre glissante
     return already
 
 
@@ -1127,13 +1263,13 @@ def _receipt(s: dict) -> str:
     return "<pre>" + html.escape(body) + "</pre>"
 
 
-def _upcoming_block(s: dict) -> list:
+def _upcoming_block(drv: DriverRT, s: dict) -> list:
     """Bloc « À venir » : réservations validées, pas encore effectuées (hors CA réalisé)."""
     if not s.get("upcoming_n"):
         return []
     out = ["", f"📅 <b>À venir</b>{MID}{s['upcoming_n']} résa · {s['upcoming_ca']:.0f} € "
                f"<i>(pas encore compté)</i>"]
-    for r in store.pending_reservations(6):
+    for r in store.pending_reservations(drv.id, 6):
         dtm = reservation_datetime(r["raw"] or "")
         when = dtm.strftime("%d/%m %Hh%M") if dtm else "date ?"
         trip = f"{_short_loc(r['pickup'] or '?')} → {_short_loc(r['dropoff'] or '?')}"
@@ -1142,11 +1278,11 @@ def _upcoming_block(s: dict) -> list:
     return out
 
 
-def build_report(period: str = "jour") -> str:
-    s = store.summary(period)
+def build_report(drv: DriverRT, period: str = "jour") -> str:
+    s = store.summary(drv.id, period)
     c = s["counts"]
     lbl = _PERIOD_LABEL.get(period, period)
-    obj_set = store.get_setting("objectif_jour")
+    obj_set = store.get_setting(drv.id, "objectif_jour")
     out = [f"📊 <b>Bilan · {lbl}</b>", HR]
 
     if s["done"] or s.get("frais") or (obj_set and period in ("jour", "24h")):
@@ -1157,7 +1293,7 @@ def build_report(period: str = "jour") -> str:
             head = f"💚 <b>{s['net']:.0f} €</b> net{MID}{s['ca']:.0f} € brut"
         out += [head, "", _receipt(s), "",
                 f"✅ {s['done']} réalisées{MID}💬 {c['répondue']}{MID}📤 {c['proposée']}"]
-        obj = store.get_setting("objectif_jour")
+        obj = store.get_setting(drv.id, "objectif_jour")
         if obj and period in ("jour", "24h"):
             try:
                 obj = float(obj)
@@ -1179,9 +1315,9 @@ def build_report(period: str = "jour") -> str:
             f"📤 {c['proposée']} envoyées{MID}💬 {c['répondue']} à valider{MID}⏭️ {c['passée']} passées",
         ]
 
-    out += _upcoming_block(s)          # réservations à venir (toujours affichées)
+    out += _upcoming_block(drv, s)     # réservations à venir (toujours affichées)
 
-    done = store.list_done(period)
+    done = store.list_done(drv.id, period)
     if done:
         lines = []
         for i, r in enumerate(done, 1):
@@ -1233,10 +1369,10 @@ tbody tr:nth-child(even){background:rgba(127,127,127,.06)}
 """
 
 
-def build_table_html(period: str) -> str:
+def build_table_html(drv: DriverRT, period: str) -> str:
     """Page HTML autonome : tableau de toutes les courses de la période + totaux."""
-    s = store.summary(period)
-    rows = store.courses_detail(period)
+    s = store.summary(drv.id, period)
+    rows = store.courses_detail(drv.id, period)
     lbl = _PERIOD_LABEL.get(period, period)
 
     def esc(x):
@@ -1299,13 +1435,13 @@ def _pdf_safe(x) -> str:
     return "".join(c for c in s if ord(c) < 0x0250 or c in _PDF_KEEP).strip()
 
 
-def build_table_pdf(period: str) -> bytes:
+def build_table_pdf(drv: DriverRT, period: str) -> bytes:
     """PDF A4 designé : en-tête, cartes de totaux, tableau paginé de toutes les courses."""
     from fpdf import FPDF
     from fpdf.fonts import FontFace
 
-    s = store.summary(period)
-    rows = store.courses_detail(period)
+    s = store.summary(drv.id, period)
+    rows = store.courses_detail(drv.id, period)
     lbl = _PERIOD_LABEL.get(period, period).capitalize()
     benef = s.get("benefice", s["net"])
     INK, GREY, AMBER, GREEN = (26, 30, 38), (140, 148, 166), (178, 110, 12), (18, 154, 86)
@@ -1400,22 +1536,22 @@ def build_table_pdf(period: str) -> bytes:
     return bytes(pdf.output())
 
 
-async def send_courses_table(period: str) -> None:
-    """Envoie le tableau détaillé (PDF designé) dans le DM du bot."""
-    if not (bot and NOTIFY_USER_ID):
+async def send_courses_table(drv: DriverRT, period: str) -> None:
+    """Envoie le tableau détaillé (PDF designé) dans le DM du bot du chauffeur."""
+    if not bot:
         return
     lbl = _PERIOD_LABEL.get(period, period)
     try:
-        data = build_table_pdf(period)
+        data = build_table_pdf(drv, period)
         name = f"releve_{period}.pdf"
     except Exception as e:                       # noqa: BLE001
-        log.warning("PDF KO, repli HTML : %s", e)
-        data = build_table_html(period).encode("utf-8")
+        log.warning("%s PDF KO, repli HTML : %s", drv.tag, e)
+        data = build_table_html(drv, period).encode("utf-8")
         name = f"courses_{period}.html"
     bio = io.BytesIO(data)
     bio.name = name
     await bot.send_file(
-        NOTIFY_USER_ID, bio, force_document=True,
+        drv.id, bio, force_document=True,
         attributes=[DocumentAttributeFilename(name)],
         caption=(f"📄 <b>Relevé · {lbl}</b>\n"
                  f"<i>Toutes tes courses avec les totaux — prêt à imprimer / envoyer au comptable.</i>"),
@@ -1423,32 +1559,30 @@ async def send_courses_table(period: str) -> None:
 
 
 # ─────────────────────────── Handlers ─────────────────────────
-@client.on(events.NewMessage(chats=FEED_GROUP))
-@client.on(events.MessageEdited(chats=FEED_GROUP))
-async def on_feed(event):
-    """Suit ta position live (partagée dans le relais) + canal retour [SEND ...]."""
+# Handlers de la SESSION d'un chauffeur (son compte Telegram). Branchés par attach_driver().
+async def on_feed(drv: DriverRT, event) -> None:
+    """Relais Hermès (mode historique, optionnel) : position live + canal retour [SEND ...]."""
     # 1) position en direct : les mises à jour arrivent en éditions de message
     if event.message.geo is not None:
-        save_position(event.message.geo.lat, event.message.geo.long)
+        save_position(drv, event.message.geo.lat, event.message.geo.long)
         return
 
     # 2) canal retour : Hermès approuve -> "[SEND -1001234567890] texte de la réponse"
     m = re.match(r"^\[SEND (-?\d+)\]\s*(.+)", event.raw_text or "", re.DOTALL)
     if m:
         gid, reply = int(m.group(1)), m.group(2).strip()
-        if gid not in VTC_GROUPS:
-            log.warning("SEND refusé : %s hors liste VTC.", gid)
+        if gid not in drv.p.groups:
+            log.warning("%s SEND refusé : %s hors de ses groupes.", drv.tag, gid)
             return
-        await client.send_message(gid, reply)
-        log.info("Réponse envoyée dans %s.", gid)
+        await drv.client.send_message(gid, reply)
+        log.info("%s Réponse envoyée dans %s.", drv.tag, gid)
 
 
-@client.on(events.NewMessage(outgoing=True))
-async def on_self_note(event):
-    """/note ou /courses depuis TES Messages sauvegardés (privé à toi seul).
-    Dans la conversation de quelqu'un d'autre : on NE traite PAS (il te verrait) — on
-    supprime et on te prévient, car un compte ne peut pas envoyer un message invisible."""
-    if not event.is_private or not bot or not NOTIFY_USER_ID:
+async def on_self_note(drv: DriverRT, event) -> None:
+    """/note ou /courses depuis SES Messages sauvegardés (privé à lui seul).
+    Dans la conversation de quelqu'un d'autre : on NE traite PAS (l'autre le verrait) — on
+    supprime et on le prévient, car un compte ne peut pas envoyer un message invisible."""
+    if not event.is_private or not bot:
         return
     if BOT_SELF_ID and event.chat_id == BOT_SELF_ID:   # DM du bot -> géré par on_command
         return
@@ -1457,18 +1591,18 @@ async def on_self_note(event):
     if not low.startswith(("/note", "/courses", "/course")):
         return
 
-    # Messages sauvegardés (conversation avec toi-même) = sûr, personne d'autre ne voit
-    if CLIENT_SELF_ID and event.chat_id == CLIENT_SELF_ID:
+    # Messages sauvegardés (conversation avec soi-même) = sûr, personne d'autre ne voit
+    if drv.self_id and event.chat_id == drv.self_id:
         try:
             await event.delete()
         except Exception:                   # noqa: BLE001
             pass
         note = txt[5:].lstrip(" :").strip() if low.startswith("/note") else ""
         if low.startswith("/note") and note:
-            await send_note_picker(note)
+            await send_note_picker(drv, note)
         else:
-            await send_courses_dashboard()
-        log.info("Commande via Messages sauvegardés -> UI envoyée dans le DM du bot.")
+            await send_courses_dashboard(drv)
+        log.info("%s Commande via Messages sauvegardés -> UI envoyée dans le DM du bot.", drv.tag)
         return
 
     # Conversation avec quelqu'un d'autre : il a PU la voir (notification). Supprimer + prévenir.
@@ -1478,14 +1612,14 @@ async def on_self_note(event):
         pass
     try:
         await bot.send_message(
-            NOTIFY_USER_ID,
+            drv.id,
             "⚠️ <b>Attention</b> — tu as tapé une commande dans une conversation avec quelqu'un.\n"
             "Il a <b>pu la voir</b> (notification), même si je l'ai supprimée.\n"
             "👉 Utilise le <b>DM du bot</b> ou tes <b>Messages sauvegardés</b> pour rester privé.",
             parse_mode="html")
     except Exception:                       # noqa: BLE001
         pass
-    log.warning("Commande tapée dans une conversation tierce -> supprimée + alerte.")
+    log.warning("%s Commande tapée dans une conversation tierce -> supprimée + alerte.", drv.tag)
 
 
 # Modes de paiement rapides (code court -> libellé) proposés après « obtenue ».
@@ -1529,34 +1663,34 @@ def _course_btn_label(r) -> str:
     return f"{ic} {hhmm} {_tiny_loc(r['pickup'])}→{_tiny_loc(r['dropoff'])}{price}"
 
 
-async def send_note_picker(note_text: str) -> None:
+async def send_note_picker(drv: DriverRT, note_text: str) -> None:
     """Envoie dans le DM du bot la liste des courses récentes : tape celle à annoter."""
-    if not (bot and NOTIFY_USER_ID):
+    if not bot:
         return
-    rs = store.recent(8)
+    rs = store.recent(drv.id, 8)
     if not rs:
-        await bot.send_message(NOTIFY_USER_ID, "Aucune course à annoter pour l'instant.")
+        await bot.send_message(drv.id, "Aucune course à annoter pour l'instant.")
         return
     rows = [[Button.inline(_course_btn_label(r), f"n|{r['id']}".encode())] for r in rs]
     rows.append([Button.inline("✖️ Annuler", b"nc")])
     sent = await bot.send_message(
-        NOTIFY_USER_ID,
+        drv.id,
         f"📝 <b>Nouvelle note</b>\n« {html.escape(note_text)} »\n\n<i>Sur quelle course ?</i>",
         buttons=rows, parse_mode="html")
-    _pending_note[sent.id] = note_text
+    drv.pending_note[sent.id] = note_text
 
 
-async def send_courses_dashboard() -> None:
+async def send_courses_dashboard(drv: DriverRT) -> None:
     """Tableau des courses récentes (par statut) — touche une course pour agir dessus."""
-    if not (bot and NOTIFY_USER_ID):
+    if not bot:
         return
-    rs = store.recent(8)
+    rs = store.recent(drv.id, 8)
     if not rs:
-        await bot.send_message(NOTIFY_USER_ID, "Aucune course enregistrée pour l'instant.")
+        await bot.send_message(drv.id, "Aucune course enregistrée pour l'instant.")
         return
     rows = [[Button.inline(_course_btn_label(r), f"c|{r['id']}".encode())] for r in rs]
     await bot.send_message(
-        NOTIFY_USER_ID,
+        drv.id,
         "🗂️ <b>Tes courses récentes</b>\n"
         f"{HR}\n"
         "📤 envoyée · 💬 à valider · ✅ obtenue · ✕ ratée\n"
@@ -1596,15 +1730,15 @@ def _course_detail(r):
     return "\n".join(lines), btns
 
 
-async def apply_edit(event, cid: int, field: str, txt: str) -> None:
-    """Applique une édition (note/prix/comm) à la course #cid et confirme."""
-    r = store.get(cid)
+async def apply_edit(drv: DriverRT, event, cid: int, field: str, txt: str) -> None:
+    """Applique une édition (note/prix/comm) à la course #cid du chauffeur et confirme."""
+    r = store.get(cid, drv.id)
     if not r:
         await event.respond("Course introuvable.")
         return
     trip = f"{_short_loc(r['pickup'] or '?')} → {_short_loc(r['dropoff'] or '?')}"
     if field == "note":
-        nr = store.append_note(cid, txt)
+        nr = store.append_note(cid, txt, drv.id)
         await event.respond(f"📝 <b>Note</b> · {html.escape(trip)}\n« {html.escape(nr['note'])} »",
                             parse_mode="html")
         return
@@ -1614,12 +1748,13 @@ async def apply_edit(event, cid: int, field: str, txt: str) -> None:
         return
     val = float(m.group(1).replace(",", "."))
     if field == "prix":
-        nr = store.adjust_amount(cid, price=val, rate=(COMMISSION_RATE or None))
+        nr = store.adjust_amount(cid, price=val, rate=(drv.p.commission_rate or None),
+                                 driver_id=drv.id)
         extra = f" · net {nr['net']:.0f} €" if nr["commission"] else ""
         await event.respond(f"✏️ <b>Prix corrigé</b> · {html.escape(trip)}\n💶 {val:.0f} €{extra}",
                             parse_mode="html")
     else:  # comm
-        nr = store.adjust_amount(cid, commission=val)
+        nr = store.adjust_amount(cid, commission=val, driver_id=drv.id)
         await event.respond(f"🧾 <b>Commission corrigée</b> · {html.escape(trip)}\n"
                             f"{val:.0f} € · net {nr['net']:.0f} €", parse_mode="html")
 
@@ -1685,9 +1820,13 @@ async def _calendar_selftest() -> None:
         log.warning("Agenda : self-test écriture bloqué (timeout/permission) : %r", e)
 
 
-async def add_reservation_to_calendar(cid: int) -> bool:
-    """Ajoute une réservation (par id) à l'agenda, avec date/heure lues du texte."""
-    r = store.get(cid)
+async def add_reservation_to_calendar(drv: DriverRT, cid: int) -> bool:
+    """Ajoute une réservation (par id) à l'agenda, avec date/heure lues du texte.
+    L'agenda est celui de la machine qui héberge le pont : réservé au chauffeur propriétaire.
+    Les autres reçoivent le fichier .ics (bouton « Fichier agenda »)."""
+    if not drv.p.is_owner:
+        return False
+    r = store.get(cid, drv.id)
     if not r:
         return False
     dt = reservation_datetime(r["raw"] or "")
@@ -1699,18 +1838,18 @@ async def add_reservation_to_calendar(cid: int) -> bool:
     return await add_event_to_calendar(f"🚕 VTC · {trip}", dt, desc, r["pickup"] or "")
 
 
-async def send_reservation_ics(cid: int) -> None:
+async def send_reservation_ics(drv: DriverRT, cid: int) -> None:
     """Envoie un fichier .ics (agenda) pour une réservation, avec rappels 24 h et 1 h avant."""
-    if not (bot and NOTIFY_USER_ID):
+    if not bot:
         return
-    r = store.get(cid)
+    r = store.get(cid, drv.id)
     if not r:
         return
     trip = f"{_short_loc(r['pickup'] or '?')} → {_short_loc(r['dropoff'] or '?')}"
     dt = reservation_datetime(r["raw"] or "")
     if dt is None:
         await bot.send_message(
-            NOTIFY_USER_ID,
+            drv.id,
             f"⚠️ Je n'ai pas pu lire la date/heure de cette réservation ({html.escape(trip)}). "
             f"Ajoute-la à la main.", parse_mode="html")
         return
@@ -1721,28 +1860,169 @@ async def send_reservation_ics(cid: int) -> None:
     bio = io.BytesIO(ics.encode("utf-8"))
     bio.name = "reservation.ics"
     await bot.send_file(
-        NOTIFY_USER_ID, bio, force_document=True,
+        drv.id, bio, force_document=True,
         attributes=[DocumentAttributeFilename("reservation.ics")],
         caption=(f"📅 <b>{dt.strftime('%d/%m à %Hh%M')}</b> · {html.escape(trip)}\n"
                  f"<i>Ouvre le fichier pour l'ajouter à ton agenda — rappels 24 h et 1 h avant.</i>"),
         parse_mode="html")
 
 
+# ───────────────────── Réglages du chauffeur (/reglages) ─────────────────────
+# Chaque chauffeur règle ses propres seuils depuis le DM du bot : prix minimum, distance
+# jusqu'au départ, temps, €/km, rayon des réservations… Définitions dans drivers.SETTINGS.
+SETTING_ALIASES = {
+    "/prixmin": "min_price", "/prix_min": "min_price",
+    "/distancemax": "max_pickup_km", "/distance": "max_pickup_km", "/kmmax": "max_pickup_km",
+    "/tempsmax": "threshold_min", "/temps": "threshold_min",
+    "/eurkm": "eurkm_min", "/rayon": "resa_radius_km",
+}
+
+
+def rules_summary(drv: DriverRT) -> str:
+    """Ce que le chauffeur reçoit, en une phrase par type de course (lecture rapide)."""
+    g, n = drv.cfg, D.fmt_num
+    imm = f"≤ {n(g('threshold_min'))} min"
+    if g("max_pickup_km"):
+        imm += f", ≤ {n(g('max_pickup_km'))} km"
+    resa = f"≥ {n(g('eurkm_min'))} €/km"
+    if g("resa_radius_km"):
+        resa += f", ≤ {n(g('resa_radius_km'))} km de toi"
+    price = f", ≥ {n(g('min_price'))} €" if g("min_price") else ""
+    return (f"🚕 <b>Immédiates</b> : {imm}{price}\n"
+            f"📅 <b>Réservations</b> : {resa}{price}")
+
+
+def settings_home(drv: DriverRT, advanced: bool = False) -> "tuple[str, list]":
+    specs = [s for s in D.SETTINGS if s.advanced == advanced]
+    vals = [(s, D.fmt_value(s, drv.cfg(s.key))) for s in specs]
+    lines = ["⚙️ <b>Réglages" + (" avancés" if advanced else "") + "</b>", HR]
+    if not advanced:
+        lines += [rules_summary(drv), ""]
+    lines += [f"{html.escape(s.label)}{MID}<b>{html.escape(v)}</b>" for s, v in vals]
+    lines += ["", "<i>Touche un réglage pour le modifier — effet immédiat, pour toi seul.</i>"]
+    btns = [[Button.inline(f"{s.label} · {v}"[:60], f"st|{s.key}".encode())] for s, v in vals]
+    btns.append([Button.inline("⬅️ Réglages", b"st|home")] if advanced
+                else [Button.inline("🔧 Avancé", b"st|adv")])
+    return "\n".join(lines), btns
+
+
+def settings_detail(drv: DriverRT, key: str, note: str = "") -> "tuple[str, list]":
+    s = D.SETTINGS_BY_KEY[key]
+    cur = D.fmt_value(s, drv.cfg(key))
+    default = D.fmt_value(s, s.default)
+    lines = [f"⚙️ <b>{html.escape(s.label)}</b>", HR,
+             f"Actuel{MID}<b>{html.escape(cur)}</b>{MID}<i>défaut : {html.escape(default)}</i>"]
+    if s.help:
+        lines += ["", f"<i>{html.escape(s.help)}</i>"]
+    if note:
+        lines += ["", note]
+    unit = f" {s.unit}" if s.unit else ""
+    btns = []
+    if s.kind in ("int", "float"):
+        st = D.fmt_num(s.step)
+        btns.append([Button.inline(f"➖ {st}{unit}", f"st|{key}|-".encode()),
+                     Button.inline(f"➕ {st}{unit}", f"st|{key}|+".encode())])
+    if s.kind == "bool":
+        btns.append([Button.inline("🔄 Basculer", f"st|{key}|+".encode())])
+    else:
+        btns.append([Button.inline("✍️ Saisir", f"st|{key}|in".encode())])
+    btns.append([Button.inline("↩︎ Valeur par défaut", f"st|{key}|rst".encode())])
+    btns.append([Button.inline("⬅️ Retour", b"st|adv" if s.advanced else b"st|home")])
+    return "\n".join(lines), btns
+
+
+def _persist_settings(drv: DriverRT) -> None:
+    store.save_driver_settings(drv.id, drv.p.settings)
+
+
+async def send_settings_home(drv: DriverRT, event) -> None:
+    text, btns = settings_home(drv)
+    await event.respond(text, buttons=btns, parse_mode="html")
+
+
+async def apply_setting_input(drv: DriverRT, event, key: str, txt: str) -> None:
+    """Valeur saisie à la main pour un réglage : validée, sinon on redemande (borne affichée)."""
+    s = D.SETTINGS_BY_KEY.get(key)
+    if s is None:
+        return
+    try:
+        val = drv.p.set(key, txt)
+    except ValueError as e:
+        drv.awaiting = (0, f"set:{key}")                 # il peut réessayer sans rouvrir l'écran
+        await event.respond(f"❌ Valeur refusée : {html.escape(str(e))}. Réessaie, ou /reglages pour annuler.",
+                            parse_mode="html")
+        return
+    _persist_settings(drv)
+    log.info("%s Réglage %s = %r", drv.tag, key, val)
+    text, btns = settings_detail(drv, key, note="✅ <b>Enregistré</b>")
+    await event.respond(text, buttons=btns, parse_mode="html")
+
+
+async def handle_settings_callback(drv: DriverRT, event, data: str) -> None:
+    """Callbacks st|home, st|adv, st|<clé>, st|<clé>|+|-|in|rst."""
+    parts = data.split("|")
+    try:
+        if parts[1] in ("home", "adv"):
+            text, btns = settings_home(drv, advanced=(parts[1] == "adv"))
+        else:
+            key = parts[1]
+            if key not in D.SETTINGS_BY_KEY:
+                await event.answer("Réglage inconnu", alert=True)
+                return
+            s = D.SETTINGS_BY_KEY[key]
+            op = parts[2] if len(parts) > 2 else ""
+            note = ""
+            if op in ("+", "-"):
+                before = drv.cfg(key)
+                drv.p.set(key, D.step_value(s, before, +1 if op == "+" else -1))
+                _persist_settings(drv)
+                if drv.cfg(key) == before:
+                    await event.answer("Limite atteinte")
+            elif op == "rst":
+                drv.p.reset(key)
+                _persist_settings(drv)
+                note = "↩︎ <i>Valeur par défaut rétablie.</i>"
+            elif op == "in":
+                drv.awaiting = (0, f"set:{key}")
+                hint = "oui ou non" if s.kind == "bool" else ("le texte" if s.kind == "text"
+                                                              else f"le nombre{' en ' + s.unit if s.unit else ''}")
+                await event.answer("✍️ Écris la valeur en message")
+                await bot.send_message(drv.id, f"✍️ Écris {hint} pour <b>{html.escape(s.label)}</b>.",
+                                       parse_mode="html")
+                return
+            text, btns = settings_detail(drv, key, note)
+        await event.edit(text, buttons=btns, parse_mode="html")
+    except Exception as e:                               # noqa: BLE001  (message identique, valeur invalide…)
+        log.debug("%s Réglages : %s", drv.tag, e)
+        try:
+            await event.answer()
+        except Exception:                                # noqa: BLE001
+            pass
+
+
 if bot is not None:
     @bot.on(events.CallbackQuery)
     async def on_button(event):
-        """Tap sur un bouton d'alerte -> poste la réponse, puis suit le résultat (obtenue/ratée)."""
-        if NOTIFY_USER_ID and event.sender_id != NOTIFY_USER_ID:
+        """Tap sur un bouton d'alerte -> poste la réponse, puis suit le résultat (obtenue/ratée).
+        Le chauffeur est identifié par SON id Telegram : tout (course, alerte, groupe, session)
+        est résolu à partir de lui, jamais d'un état global."""
+        drv = DRIVERS.get(event.sender_id)
+        if drv is None:
             await event.answer("Non autorisé", alert=True)
             return
         data = event.data.decode("utf-8", "ignore")
 
+        # ── ⚙️ Réglages (prix minimum, distance, …) ──
+        if data.startswith("st|"):
+            await handle_settings_callback(drv, event, data)
+            return
+
         # ── ❌ Refuser : la course n'est pas prise ──
         if data == "x":
-            _alert_ctx.pop(event.message_id, None)
-            cid = _pending_alerts.pop(event.message_id, None)
+            drv.alert_ctx.pop(event.message_id, None)
+            cid = drv.pending_alerts.pop(event.message_id, None)
             if cid:
-                store.set_status(cid, "passée")
+                store.set_status(cid, "passée", drv.id)
             await event.edit("❌ <b>Course refusée</b>", parse_mode="html")
             return
 
@@ -1755,8 +2035,8 @@ if bot is not None:
             except ValueError:
                 await event.answer("Donnée invalide", alert=True)
                 return
-            ctx = _alert_ctx.get(event.message_id)
-            if ctx is None or event.message_id not in _pending_alerts:
+            ctx = drv.alert_ctx.get(event.message_id)
+            if ctx is None or event.message_id not in drv.pending_alerts:
                 await event.answer("⏱️ Alerte expirée — rien envoyé.", alert=True)
                 return
             if data.startswith("b|"):
@@ -1774,9 +2054,9 @@ if bot is not None:
                     buttons=rows, parse_mode="html", link_preview=False)
                 return
             await event.answer("🧭 Calcul depuis ta position…")
-            fresh = await _fresh_eta(ctx)
+            fresh = await _fresh_eta(drv, ctx)
             eta_now, dist_now, live = fresh
-            best, opts = time_options(eta_now)
+            best, opts = driver_time_options(drv, eta_now)
 
             def label(o: str) -> str:
                 return "SP (sur place)" if o == "SP" else f"{o} min"
@@ -1800,7 +2080,7 @@ if bot is not None:
         # ── 📄 Tableau détaillé (fichier HTML) ──
         if data.startswith("tbl|"):
             await event.answer("📄 Génération du tableau…")
-            await send_courses_table(data.split("|", 1)[1] or "mois")
+            await send_courses_table(drv, data.split("|", 1)[1] or "mois")
             return
 
         # ── ✅/❌ Résultat : le chauffeur confirme s'il a eu la course ──
@@ -1812,14 +2092,17 @@ if bot is not None:
                 await event.answer("Donnée invalide", alert=True)
                 return
             if won == "1":
-                r = store.get(cid)
+                r = store.get(cid, drv.id)
+                if r is None:
+                    await event.answer("Course introuvable", alert=True)
+                    return
                 if r["kind"] == "resa":
                     # Réservation : validée mais À VENIR -> ne compte pas encore dans le CA.
-                    store.set_status(cid, "réservée")
+                    store.set_status(cid, "réservée", drv.id)
                     dtm = reservation_datetime(r["raw"] or "")
                     if dtm is not None:
-                        store.set_sched(cid, dtm.timestamp())
-                    cal_ok = await add_reservation_to_calendar(cid)
+                        store.set_sched(cid, dtm.timestamp(), drv.id)
+                    cal_ok = await add_reservation_to_calendar(drv, cid)
                     cal_line = "\n📅 <i>Ajouté à ton agenda — rappels 24 h et 1 h.</i>" if cal_ok else ""
                     rows = []
                     if not cal_ok:
@@ -1832,14 +2115,14 @@ if bot is not None:
                         f"<i>Je te redemanderai après la course de la valider — ou marque-la ici.</i>",
                         buttons=rows, parse_mode="html")
                 else:
-                    store.set_status(cid, "obtenue")
+                    store.set_status(cid, "obtenue", drv.id)
                     pay_row = [Button.inline(lbl, f"p|{cid}|{code}".encode())
                                for code, lbl in PAYMENTS.items()]
                     await event.edit(
                         f"✅ <b>Course obtenue</b>\n{HR}\n{_recap_line(r)}\n\n💳 <i>Mode de paiement ?</i>",
                         buttons=[pay_row], parse_mode="html")
             else:
-                store.set_status(cid, "ratée")
+                store.set_status(cid, "ratée", drv.id)
                 await event.edit("✕ <b>Course ratée</b>{}<i>enregistré</i>".format(MID), parse_mode="html")
             return
 
@@ -1851,19 +2134,19 @@ if bot is not None:
             except ValueError:
                 await event.answer("Donnée invalide", alert=True)
                 return
-            r = store.get(cid)
+            r = store.get(cid, drv.id)
             if not r:
                 await event.answer("Course introuvable", alert=True)
                 return
             if ok == "1":
-                store.set_status(cid, "effectuée")
+                store.set_status(cid, "effectuée", drv.id)
                 pay_row = [Button.inline(lbl, f"p|{cid}|{code}".encode())
                            for code, lbl in PAYMENTS.items()]
                 await event.edit(
                     f"✅ <b>Réservation effectuée</b>\n{HR}\n{_recap_line(r)}\n\n💳 <i>Mode de paiement ?</i>",
                     buttons=[pay_row], parse_mode="html")
             else:
-                store.set_status(cid, "annulée")
+                store.set_status(cid, "annulée", drv.id)
                 await event.edit(f"🚫 <b>Réservation annulée</b>{MID}<i>ne compte pas</i>", parse_mode="html")
             return
 
@@ -1875,7 +2158,7 @@ if bot is not None:
                 await event.answer("Donnée invalide", alert=True)
                 return
             await event.answer("📅 Fichier agenda envoyé")
-            await send_reservation_ics(cid)
+            await send_reservation_ics(drv, cid)
             return
 
         # ── 💳 Mode de paiement : tap après « obtenue » ──
@@ -1887,8 +2170,11 @@ if bot is not None:
                 await event.answer("Donnée invalide", alert=True)
                 return
             pay = PAYMENTS.get(code, code)
-            store.set_payment(cid, pay)
-            r = store.get(cid)
+            store.set_payment(cid, pay, drv.id)
+            r = store.get(cid, drv.id)
+            if r is None:
+                await event.answer("Course introuvable", alert=True)
+                return
             title = "Réservation effectuée" if r["status"] == "effectuée" else "Course obtenue"
             await event.edit(
                 f"✅ <b>{title}</b>\n{HR}\n{_recap_line(r)}\n\n"
@@ -1898,7 +2184,7 @@ if bot is not None:
 
         # ── 📝 Sélecteur « sur quelle course ? » : tap sur une course pour y lier la note ──
         if data == "nc":
-            _pending_note.pop(event.message_id, None)
+            drv.pending_note.pop(event.message_id, None)
             await event.edit("✖️ Annulé")
             return
         if data.startswith("n|"):
@@ -1907,11 +2193,11 @@ if bot is not None:
             except ValueError:
                 await event.answer("Donnée invalide", alert=True)
                 return
-            note = _pending_note.pop(event.message_id, None)
+            note = drv.pending_note.pop(event.message_id, None)
             if not note:
                 await event.answer("Note expirée — retape /note.", alert=True)
                 return
-            nr = store.append_note(cid, note)
+            nr = store.append_note(cid, note, drv.id)
             trip = f"{_short_loc(nr['pickup'] or '?')} → {_short_loc(nr['dropoff'] or '?')}"
             await event.edit(f"📝 <b>Note ajoutée</b> · {html.escape(trip)}\n« {html.escape(nr['note'])} »",
                              parse_mode="html")
@@ -1924,7 +2210,7 @@ if bot is not None:
             except ValueError:
                 await event.answer("Donnée invalide", alert=True)
                 return
-            r = store.get(cid)
+            r = store.get(cid, drv.id)
             if not r:
                 await event.answer("Course introuvable", alert=True)
                 return
@@ -1942,15 +2228,14 @@ if bot is not None:
             except (ValueError, IndexError):
                 await event.answer("Donnée invalide", alert=True)
                 return
-            _awaiting[NOTIFY_USER_ID] = (cid, field)
-            r = store.get(cid)
+            drv.awaiting = (cid, field)
+            r = store.get(cid, drv.id)
             trip = f"{_short_loc(r['pickup'] or '?')} → {_short_loc(r['dropoff'] or '?')}" if r else "?"
             ask = {"prix": "le nouveau <b>prix</b> (ex. 45)",
                    "comm": "la <b>commission</b> en € (ex. 8)",
                    "note": "la <b>note</b> (paiement, détail…)"}.get(field, "la valeur")
             await event.answer("✍️ Écris la valeur en message")
-            await bot.send_message(
-                NOTIFY_USER_ID, f"✍️ Écris {ask} pour <b>{html.escape(trip)}</b> <code>#{cid}</code>.",
+            await bot.send_message(drv.id, f"✍️ Écris {ask} pour <b>{html.escape(trip)}</b> <code>#{cid}</code>.",
                 parse_mode="html")
             return
 
@@ -1972,20 +2257,20 @@ if bot is not None:
         except ValueError:
             await event.answer("Donnée invalide", alert=True)
             return
-        if gid not in VTC_GROUPS:
+        if gid not in drv.p.groups:
             await event.answer("Groupe non autorisé", alert=True)
             return
-        _alert_ctx.pop(event.message_id, None)
-        cid = _pending_alerts.pop(event.message_id, None)
+        drv.alert_ctx.pop(event.message_id, None)
+        cid = drv.pending_alerts.pop(event.message_id, None)
         if cid is None:                                            # expirée ou déjà répondue
             await event.answer("⏱️ Alerte expirée — rien envoyé.", alert=True)
             return
         try:
-            await client.send_message(gid, reply, reply_to=mid)   # réponse citée à la course
+            await drv.client.send_message(gid, reply, reply_to=mid)   # réponse citée à la course
         except Exception:                                          # course supprimée/expirée
-            await client.send_message(gid, reply)
-        store.set_status(cid, "répondue")
-        store.set_reply(cid, reply)
+            await drv.client.send_message(gid, reply)
+        store.set_status(cid, "répondue", drv.id)
+        store.set_reply(cid, reply, drv.id)
         outcome = [[Button.inline("✅ Obtenue", f"o|{cid}|1".encode()),
                     Button.inline("❌ Ratée", f"o|{cid}|0".encode())]]
         link = course_link(gid, mid)
@@ -1997,16 +2282,19 @@ if bot is not None:
             buttons=outcome, parse_mode="html")
         log.info("Réponse « %s » envoyée dans %s via bouton.", reply, gid)
 
-    @bot.on(events.NewMessage(from_users=NOTIFY_USER_ID or None))
+    _stranger_seen: dict[int, float] = {}          # id inconnu -> dernier refus (anti-spam)
+
+    @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def on_bot_location_new(event):
-        """Partage de position en direct DANS le DM du bot -> source de position (remplace le groupe)."""
-        if event.message.geo is None:
+        """Partage de position en direct DANS le DM du bot -> position de CE chauffeur."""
+        drv = DRIVERS.get(event.sender_id)
+        if drv is None or event.message.geo is None:
             return
-        was_missing = load_position() is None
-        save_position(event.message.geo.lat, event.message.geo.long)
+        was_missing = load_position(drv) is None
+        save_position(drv, event.message.geo.lat, event.message.geo.long)
         period = getattr(event.message.media, "period", None)   # durée du partage live (ex. 28800 = 8 h)
         if period:
-            schedule_live_expiry(period)
+            schedule_live_expiry(drv, period)
         if was_missing:
             await event.respond(
                 "✅ <b>Position activée</b>\n"
@@ -2014,31 +2302,62 @@ if bot is not None:
                 "Je surveille les courses proches. 🚕 <i>(garde le partage en direct actif.)</i>",
                 parse_mode="html")
 
-    @bot.on(events.MessageEdited(from_users=NOTIFY_USER_ID or None))
+    @bot.on(events.MessageEdited(func=lambda e: e.is_private))
     async def on_bot_location_edit(event):
         """Mises à jour de la position en direct (arrivent en éditions de message)."""
-        if event.message.geo is not None:
-            save_position(event.message.geo.lat, event.message.geo.long)
+        drv = DRIVERS.get(event.sender_id)
+        if drv is not None and event.message.geo is not None:
+            save_position(drv, event.message.geo.lat, event.message.geo.long)
 
-    @bot.on(events.NewMessage(from_users=NOTIFY_USER_ID or None))
+    @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def on_command(event):
-        """Commandes DM : /resume, /courses, /note, /prix, /comm, /aide (+ saisie de note en attente)."""
+        """Commandes DM : /resume, /courses, /reglages, /note, /prix, /comm, /aide
+        (+ saisie en attente : note, prix, commission ou valeur d'un réglage)."""
         txt = (event.raw_text or "").strip()
         low = txt.lower()
         if not txt:                          # message sans texte (position, média…) -> ignore
             return
-        # saisie en attente (bouton ✏️ Prix / 🧾 Commission / 📝 Note d'une fiche)
-        aw = _awaiting.get(NOTIFY_USER_ID)
+        drv = DRIVERS.get(event.sender_id)
+        if drv is None:
+            # Inconnu : le bot est privé. On donne l'id à communiquer à l'admin (1 réponse / 10 min).
+            now = time.time()
+            if now - _stranger_seen.get(event.sender_id, 0) > 600:
+                _stranger_seen[event.sender_id] = now
+                await event.respond(
+                    "🔒 <b>Bot privé.</b>\nTu n'es pas encore inscrit. Donne cet identifiant à "
+                    f"l'administrateur : <code>{event.sender_id}</code>", parse_mode="html")
+                log.info("Message d'un inconnu (id %s) ignoré.", event.sender_id)
+            return
+        # saisie en attente (bouton ✏️ Prix / 🧾 Commission / 📝 Note d'une fiche, ou un réglage)
+        aw = drv.awaiting
         if aw is not None:
             if txt.startswith("/"):
-                _awaiting.pop(NOTIFY_USER_ID, None)             # une commande annule la saisie
+                drv.awaiting = None                              # une commande annule la saisie
             else:
                 cid, field = aw
-                _awaiting.pop(NOTIFY_USER_ID, None)
-                await apply_edit(event, cid, field, txt)
+                drv.awaiting = None
+                if field.startswith("set:"):
+                    await apply_setting_input(drv, event, field[4:], txt)
+                else:
+                    await apply_edit(drv, event, cid, field, txt)
                 return
+        # ── ⚙️ Réglages : /reglages, ou un raccourci (/prixmin 30, /distancemax 12…) ──
+        cmd = low.split(None, 1)[0] if low.startswith("/") else ""
+        cmd = cmd.split("@", 1)[0]
+        if cmd in ("/reglages", "/réglages", "/reglage", "/settings", "/parametres", "/paramètres"):
+            await send_settings_home(drv, event)
+            return
+        if cmd in SETTING_ALIASES:
+            key = SETTING_ALIASES[cmd]
+            arg = txt.split(None, 1)[1] if len(txt.split(None, 1)) > 1 else ""
+            if arg:
+                await apply_setting_input(drv, event, key, arg)
+            else:
+                text, btns = settings_detail(drv, key)
+                await event.respond(text, buttons=btns, parse_mode="html")
+            return
         if low.startswith(("/courses", "/course")):
-            await send_courses_dashboard()
+            await send_courses_dashboard(drv)
             return
         if low.startswith(("/resume", "/résumé", "/bilan", "/jour", "/semaine", "/mois", "/tout")):
             period = "jour"
@@ -2049,7 +2368,7 @@ if bot is not None:
             elif low.startswith("/tout") or "tout" in low or "total" in low:
                 period = "tout"
             btn = [[Button.inline("📄 Tableau détaillé", f"tbl|{period}".encode())]]
-            await event.respond(build_report(period), buttons=btn,
+            await event.respond(build_report(drv, period), buttons=btn,
                                 parse_mode="html", link_preview=False)
         elif low.startswith(("/tableau", "/table", "/export")):
             period = "mois"
@@ -2059,12 +2378,12 @@ if bot is not None:
                 period = "jour"
             elif "tout" in low or "total" in low:
                 period = "tout"
-            await send_courses_table(period)
+            await send_courses_table(drv, period)
         elif low.startswith("/prix"):
             m = re.search(r"(\d+(?:[.,]\d+)?)", txt)
-            r = store.last_realized_course()
+            r = store.last_realized_course(drv.id)
             if m and r:
-                await apply_edit(event, r["id"], "prix", txt)
+                await apply_edit(drv, event, r["id"], "prix", txt)
                 await event.respond("<i>Pas la bonne course ? → /courses pour choisir précisément.</i>",
                                     parse_mode="html")
             else:
@@ -2072,9 +2391,9 @@ if bot is not None:
                                     parse_mode="html")
         elif low.startswith("/comm"):
             m = re.search(r"(\d+(?:[.,]\d+)?)", txt)
-            r = store.last_realized_course()
+            r = store.last_realized_course(drv.id)
             if m and r:
-                await apply_edit(event, r["id"], "comm", txt)
+                await apply_edit(drv, event, r["id"], "comm", txt)
                 await event.respond("<i>Pas la bonne course ? → /courses pour choisir précisément.</i>",
                                     parse_mode="html")
             else:
@@ -2089,8 +2408,8 @@ if bot is not None:
             else:
                 amt = float(m.group(1).replace(",", "."))
                 label = (rest[:m.start()] + rest[m.end():]).strip(" :-€").strip() or "frais"
-                store.add_expense(amt, label)
-                fr = store.expenses_total("jour")
+                store.add_expense(drv.id, amt, label)
+                fr = store.expenses_total(drv.id, "jour")
                 await event.respond(
                     f"⛽ <b>Frais ajouté</b> · {amt:.0f} € · {html.escape(label)}\n"
                     f"<i>Total frais du jour : {fr:.0f} € — /resume pour le bénéfice.</i>",
@@ -2098,13 +2417,13 @@ if bot is not None:
         elif low.startswith(("/objectif", "/but")):
             m = re.search(r"(\d+(?:[.,]\d+)?)", txt)
             if not m:
-                cur = store.get_setting("objectif_jour")
+                cur = store.get_setting(drv.id, "objectif_jour")
                 await event.respond(
                     f"🎯 Objectif du jour actuel : <b>{cur or 'aucun'} €</b>.\n"
                     f"Usage : <b>/objectif 200</b>", parse_mode="html")
             else:
                 obj = float(m.group(1).replace(",", "."))
-                store.set_setting("objectif_jour", obj)
+                store.set_setting(drv.id, "objectif_jour", obj)
                 await event.respond(f"🎯 <b>Objectif du jour : {obj:.0f} €</b> — visible dans /resume.",
                                     parse_mode="html")
         elif low.startswith("/note"):
@@ -2118,18 +2437,19 @@ if bot is not None:
                 return
             # réponse à une carte d'alerte -> ciblage direct ; sinon -> sélecteur de course
             rid = event.message.reply_to.reply_to_msg_id if event.message.reply_to else None
-            target = store.find_by_alert(rid) if rid else None
+            target = store.find_by_alert(rid, drv.id) if rid else None
             if target is not None:
-                nr = store.append_note(target["id"], note)
+                nr = store.append_note(target["id"], note, drv.id)
                 trip = f"{_short_loc(nr['pickup'] or '?')} → {_short_loc(nr['dropoff'] or '?')}"
                 await event.respond(f"📝 Note ajoutée · {html.escape(trip)}\n« {html.escape(nr['note'])} »",
                                     parse_mode="html")
             else:
-                await send_note_picker(note)
+                await send_note_picker(drv, note)
         elif low.startswith(("/aide", "/help", "/start")):
             await event.respond(
                 "🚕 <b>Assistant courses</b>\n"
                 f"{HR}\n"
+                f"⚙️ <b>/reglages</b>{MID}prix minimum, distance, temps, €/km, rayon\n"
                 f"📊 <b>/resume</b>{MID}bilan &amp; bénéfice <i>· /semaine · /mois</i>\n"
                 f"📄 <b>/tableau</b> <i>mois</i>{MID}toutes tes courses en tableau\n"
                 f"🗂️ <b>/courses</b>{MID}valider, corriger prix/comm, annoter\n"
@@ -2142,12 +2462,16 @@ if bot is not None:
                 parse_mode="html")
 
 
-@client.on(events.NewMessage(chats=VTC_GROUPS, incoming=True))
-async def on_course(event):
+# ─────────────────────── Courses : une décision par chauffeur ───────────────────────
+async def on_course(drv: DriverRT, event) -> None:
+    """Message d'un groupe de CE chauffeur. Chaque chauffeur a sa propre session : le même
+    message arrive N fois (une par abonné du groupe) et chacun le juge avec SES réglages."""
     key = (event.chat_id, event.id)
-    if key in _seen_courses:
+    if key in drv.seen_courses:
         return
-    _seen_courses.add(key)
+    drv.seen_courses.add(key)
+    if len(drv.seen_courses) > 5000:                 # borne la mémoire d'un service permanent
+        drv.seen_courses.clear()
 
     text = event.raw_text or ""
     if not is_course(text):
@@ -2156,36 +2480,48 @@ async def on_course(event):
     # un message peut contenir PLUSIEURS réservations -> une alerte par course
     segments = split_courses(text)
     if len(segments) > 1:
-        log.info("Message multi-courses -> %d segments (gid %s).", len(segments), event.chat_id)
+        log.info("%s Message multi-courses -> %d segments (gid %s).", drv.tag, len(segments), event.chat_id)
     for seg in segments:
-        await _handle_course(seg, event.chat_id, event.id)
+        try:
+            await _handle_course(drv, seg, event.chat_id, event.id)
+        except Exception:                            # noqa: BLE001  (un chauffeur ne bloque jamais les autres)
+            log.exception("%s Traitement de course KO (gid %s).", drv.tag, event.chat_id)
 
 
-async def _handle_course(text: str, gid: int, mid: int) -> None:
-    """Traite UNE course (immédiate ou réservation) : filtres, dédup, décision, alerte."""
-    if requires_van(text):                      # tu ne prends pas les courses van
-        log.info("Course van ignorée.")
+async def _handle_course(drv: DriverRT, text: str, gid: int, mid: int) -> None:
+    """Traite UNE course pour UN chauffeur (immédiate ou réservation) : filtres, dédup,
+    décision selon ses réglages, alerte."""
+    if requires_van(text) and not drv.cfg("accept_van"):
+        log.info("%s Course van ignorée.", drv.tag)
         return
 
     # même course repostée dans un autre groupe -> une seule alerte / une seule réponse
     fp = course_fingerprint(text)
     if fp is not None:
-        if is_duplicate_course(fp):
-            log.info("Doublon inter-groupes ignoré (gid %s).", gid)
+        if is_duplicate_course(drv, fp):
+            log.info("%s Doublon inter-groupes ignoré (gid %s).", drv.tag, gid)
             return
-    elif is_duplicate_course(course_text_fingerprint(text), DEDUP_TEXT_WINDOW_SECONDS):
+    elif is_duplicate_course(drv, course_text_fingerprint(text), DEDUP_TEXT_WINDOW_SECONDS):
         # Pas de code postal exploitable : on retombe sur le texte, fenêtre courte.
-        log.info("Repost identique ignoré (gid %s, fenêtre %d s).", gid, DEDUP_TEXT_WINDOW_SECONDS)
+        log.info("%s Repost identique ignoré (gid %s, fenêtre %d s).", drv.tag, gid, DEDUP_TEXT_WINDOW_SECONDS)
         return
 
     # Réservation -> logique rentabilité (€/km). Immédiat -> logique proximité (ETA).
     if is_reservation(text):
-        await handle_reservation(text, gid, mid)
+        await handle_reservation(drv, text, gid, mid)
         return
 
-    src = load_position()
+    # Prix plancher du chauffeur : refus avant tout appel réseau (géocodage, routage).
+    price = extract_price(text)
+    if price is not None:
+        ok, why = D.accept_resa_price(drv.p, price=price)
+        if not ok:
+            log.info("%s Course ignorée : %s.", drv.tag, why)
+            return
+
+    src = load_position(drv)
     if src is None:
-        await warn_position()          # rappel unique (throttlé), pas un message par course
+        await warn_position(drv)       # rappel unique (throttlé), pas un message par course
         return
 
     async with aiohttp.ClientSession() as session:
@@ -2193,33 +2529,34 @@ async def _handle_course(text: str, gid: int, mid: int) -> None:
         pickup_cand = None
         for cand in extract_pickup(text):
             geo = await geocode(session, cand)
-            await asyncio.sleep(1.1)          # respecte la limite Nominatim (~1 req/s)
             if geo:
                 pickup = geo
                 pickup_cand = cand            # texte propre du départ (pour l'affichage)
                 break
 
         if pickup is None:
-            await escalate_raw(text, src, "adresse non géocodée", gid, mid)
+            await escalate_raw(drv, text, src, "adresse non géocodée", gid, mid)
             return
 
         lat, lon, name = pickup
         eta = await route_eta(session, src, (lat, lon))
         if eta is None:
-            await escalate_raw(text, src, "OSRM indisponible", gid, mid)
+            await escalate_raw(drv, text, src, "OSRM indisponible", gid, mid)
             return
 
         eta_s, dist_m = eta
-        if eta_s <= THRESHOLD_SECONDS:
-            await escalate(session, text, pickup_cand, (lat, lon), eta_s, dist_m, gid, mid)
+        ok, why = D.accept_immediate(drv.p, price=price, eta_s=eta_s, dist_m=dist_m)
+        if ok:
+            await escalate(drv, session, text, pickup_cand, (lat, lon), eta_s, dist_m, gid, mid)
         else:
-            log.info("Course ignorée : ETA %.0f min > seuil | PEC=%r (%s) | brut=%r",
-                     eta_s / 60, pickup_cand, name, text[:80].replace("\n", " "))
+            log.info("%s Course ignorée : %s | PEC=%r (%s) | brut=%r",
+                     drv.tag, why, pickup_cand, name, text[:80].replace("\n", " "))
 
 
 async def _set_bot_menu() -> None:
     """Enregistre les commandes -> menu « / » dans la conversation du bot."""
     cmds = [
+        ("reglages", "Tes réglages — prix minimum, distance, €/km, rayon"),
         ("resume",  "Bilan du jour — CA, commission, net"),
         ("semaine", "Bilan de la semaine"),
         ("mois",    "Bilan du mois"),
@@ -2241,30 +2578,178 @@ async def _set_bot_menu() -> None:
         log.warning("Menu bot KO : %s", e)
 
 
-async def _resolve_group_names() -> None:
-    """Nom lisible de chaque groupe (pour le résumé « par groupe »)."""
-    for gid in VTC_GROUPS:
+# ───────────────────── Cycle de vie des chauffeurs ─────────────────────
+def attach_driver(drv: DriverRT) -> None:
+    """Branche sur la session du chauffeur ses handlers. Les groupes sont lus à chaque
+    message dans drv.p.groups : ajouter un groupe ne demande aucun redémarrage."""
+    c = drv.client
+
+    async def _course(event):
+        if event.chat_id in drv.p.groups:
+            await on_course(drv, event)
+
+    async def _note(event):
+        await on_self_note(drv, event)
+
+    c.add_event_handler(_course, events.NewMessage(incoming=True))
+    c.add_event_handler(_note, events.NewMessage(outgoing=True))
+    if drv.p.feed_group:                              # relais Hermès (mode historique)
+        feed = drv.p.feed_group
+
+        async def _feed(event):
+            if event.chat_id == feed:
+                await on_feed(drv, event)
+
+        c.add_event_handler(_feed, events.NewMessage())
+        c.add_event_handler(_feed, events.MessageEdited())
+
+
+async def _resolve_group_names(drv: DriverRT) -> None:
+    """Nom lisible de chaque groupe du chauffeur (pour le résumé « par groupe »)."""
+    for gid in drv.p.groups:
+        if gid in GROUP_NAMES:
+            continue
         try:
-            ent = await client.get_entity(gid)
+            ent = await drv.client.get_entity(gid)
             GROUP_NAMES[gid] = getattr(ent, "title", None) or str(gid)
         except Exception:                     # noqa: BLE001
             GROUP_NAMES[gid] = str(gid)
 
 
+async def _run_client(drv: DriverRT) -> None:
+    try:
+        await drv.client.run_until_disconnected()
+    except Exception as e:                    # noqa: BLE001
+        log.warning("%s Session interrompue : %s", drv.tag, e)
+    if DRIVERS.get(drv.id) is drv:            # coupure inattendue : la boucle de synchro relancera
+        DRIVERS.pop(drv.id, None)
+        log.warning("%s Déconnecté — nouvelle tentative au prochain cycle.", drv.tag)
+
+
+async def _start_driver(profile: "D.Profile") -> "DriverRT | None":
+    """Ouvre la session Telegram du chauffeur. Refuse une session qui n'est pas la sienne :
+    sinon ses alertes partiraient vers le DM d'un autre."""
+    drv = DriverRT(profile)
+    interactive_owner = sys.stdin.isatty() and profile.is_owner     # première connexion d'origine
+    if not os.path.exists(profile.session + ".session") and not interactive_owner:
+        # Telethon créerait un fichier de session vide : on ne laisse pas de déchet, on le dit.
+        log.error("[%s] Fichier de session absent (%s.session) — relance `python add_driver.py add`.",
+                  profile.name or profile.id, profile.session)
+        return None
+    client = TelegramClient(profile.session, API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            if interactive_owner:
+                await client.start()
+            else:
+                log.error("[%s] Session non autorisée (%s) — relance `python add_driver.py add`.",
+                          profile.name or profile.id, profile.session)
+                await client.disconnect()
+                return None
+        me = await client.get_me()
+    except Exception as e:                    # noqa: BLE001
+        log.error("[%s] Connexion impossible : %s", profile.name or profile.id, e)
+        try:
+            await client.disconnect()
+        except Exception:                     # noqa: BLE001
+            pass
+        return None
+    if me.id != profile.id:
+        log.error("[%s] La session %s appartient au compte %s, pas à %s : chauffeur ignoré.",
+                  profile.name or profile.id, profile.session, me.id, profile.id)
+        await client.disconnect()
+        return None
+    drv.client, drv.self_id = client, me.id
+    attach_driver(drv)
+    await _resolve_group_names(drv)
+    drv.runner = asyncio.create_task(_run_client(drv))
+    DRIVERS[profile.id] = drv
+    log.info("%s Connecté — %d groupe(s), seuil %s min.", drv.tag, len(profile.groups),
+             profile.get("threshold_min"))
+    if profile.is_owner and sys.platform == "darwin":
+        await _calendar_selftest()
+    return drv
+
+
+async def _stop_driver(drv: DriverRT) -> None:
+    DRIVERS.pop(drv.id, None)
+    if drv.pos_expiry_task and not drv.pos_expiry_task.done():
+        drv.pos_expiry_task.cancel()
+    if drv.runner:
+        drv.runner.cancel()
+    try:
+        await drv.client.disconnect()
+    except Exception:                         # noqa: BLE001
+        pass
+    log.info("%s Arrêté.", drv.tag)
+
+
+async def _sync_drivers_once() -> None:
+    """Aligne les sessions ouvertes sur la table `drivers` : démarre les nouveaux chauffeurs,
+    arrête les désactivés, rafraîchit groupes et réglages modifiés hors du bot (add_driver.py)."""
+    rows = {r["id"]: r for r in store.list_driver_rows()}
+    for did, row in rows.items():
+        prof = D.profile_from_row(row)
+        drv = DRIVERS.get(did)
+        if drv is None and prof.active:
+            await _start_driver(prof)
+        elif drv is not None and not prof.active:
+            await _stop_driver(drv)
+        elif drv is not None:
+            if prof.groups != drv.p.groups:
+                log.info("%s Groupes mis à jour : %s", drv.tag, prof.groups)
+                drv.p.groups = prof.groups
+                await _resolve_group_names(drv)
+            drv.p.settings = prof.settings
+            drv.p.name = prof.name
+    for did in [d for d in DRIVERS if d not in rows]:
+        await _stop_driver(DRIVERS[did])
+
+
+async def _driver_sync_loop() -> None:
+    while True:
+        try:
+            await _sync_drivers_once()
+        except Exception:                     # noqa: BLE001
+            log.exception("Synchro des chauffeurs KO.")
+        await asyncio.sleep(60)
+
+
+def _bootstrap_legacy() -> None:
+    """Premier lancement après le passage au multi-chauffeurs : le compte configuré dans
+    .env (TG_SESSION, NOTIFY_USER_ID, VTC_GROUPS) devient le chauffeur propriétaire, et tout
+    l'historique (courses, frais, objectif) lui est rattaché. Idempotent."""
+    if not store.list_driver_rows():
+        if not NOTIFY_USER_ID:
+            log.warning("Aucun chauffeur en base et NOTIFY_USER_ID vide : ajoute-en un avec "
+                        "`python add_driver.py add`.")
+            return
+        store.upsert_driver(NOTIFY_USER_ID, name="Propriétaire", session=SESSION,
+                            groups=LEGACY_GROUPS, feed_group=LEGACY_FEED_GROUP, is_owner=True)
+        log.info("Chauffeur d'origine créé depuis .env (id %s, %d groupes).",
+                 NOTIFY_USER_ID, len(LEGACY_GROUPS))
+    owner = next((r for r in store.list_driver_rows() if r["is_owner"]), None)
+    if owner is None:
+        return
+    n = store.adopt_legacy_rows(owner["id"])
+    if n:
+        log.info("%d ligne(s) d'historique rattachées au chauffeur %s.", n, owner["id"])
+    old, new = os.path.join(STATE_DIR, "position.json"), pos_path(owner["id"])
+    if os.path.exists(old) and not os.path.exists(new):
+        import shutil
+        shutil.copy2(old, new)
+
+
 async def _amain() -> None:
     store.init(COURSES_DB)            # journal des courses (persistant)
-    await client.start()              # session déjà autorisée -> pas de prompt
-    global CLIENT_SELF_ID
-    CLIENT_SELF_ID = (await client.get_me()).id      # = tes Messages sauvegardés
-    await _resolve_group_names()
-    await _calendar_selftest()
-    tasks = [client.run_until_disconnected()]
+    _bootstrap_legacy()
+    tasks = [_driver_sync_loop()]
     if bot is not None:
-        await bot.start(bot_token=BOT_TOKEN)
+        await bot.start(bot_token=BOT_TOKEN)          # le bot d'abord : les alertes en ont besoin
         global BOT_SELF_ID
         BOT_SELF_ID = (await bot.get_me()).id
         await _set_bot_menu()
-        log.info("Bot boutons actif -> DM %s.", NOTIFY_USER_ID)
         tasks.append(bot.run_until_disconnected())
         tasks.append(_reservation_reminder_loop())
         tasks.append(_daily_summary_loop())
@@ -2272,8 +2757,8 @@ async def _amain() -> None:
 
 
 def main() -> None:
-    log.info("Pont VTC démarré. Groupes : %s | relais : %s | seuil : %s min | boutons : %s",
-             VTC_GROUPS, FEED_GROUP, THRESHOLD_SECONDS // 60, "oui" if bot else "non (fallback Hermès)")
+    log.info("Pont VTC multi-chauffeurs démarré | boutons : %s",
+             "oui" if bot else "non (fallback Hermès)")
     asyncio.run(_amain())
 
 

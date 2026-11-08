@@ -89,6 +89,27 @@ Le script installe l'unité systemd, l'active au démarrage et lance le pont. À
 de là, chaque modification du code se déploie avec cette seule commande. `deploy.sh`
 ne touche ni aux sessions, ni à `state/` : ces fichiers ne vivent que sur le serveur.
 
+## Ajouter un chauffeur
+
+Chaque chauffeur a sa propre session Telegram, créée sur le serveur. Le service peut rester
+en marche. Avec le chauffeur à côté de toi, pour qu'il te dicte le code reçu dans son
+Telegram :
+
+```
+ssh root@VPS
+cd /opt/vtc-bridge
+sudo -u vtc .venv/bin/python add_driver.py add
+```
+
+La session est écrite dans `state/sessions/<id>.session` en mode 600. Le pont prend le
+chauffeur en compte sous une minute. Il reste à lui faire ouvrir le bot, envoyer `/start`
+et partager sa position en direct. `add_driver.py list` montre l'état de chacun,
+`add_driver.py disable ID` coupe une session.
+
+Ces sessions donnent un accès complet aux comptes des chauffeurs. Elles ne vivent que sur
+le serveur. La sauvegarde quotidienne ne couvre que `courses.db` : si le disque est perdu,
+chaque chauffeur doit se reconnecter avec `add_driver.py add`.
+
 ## Secrets : Infisical
 
 Les variables d'environnement vivent dans Infisical, projet `vtc-bridge`, environnement
