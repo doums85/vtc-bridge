@@ -270,6 +270,7 @@ LEAD_JUNK = re.compile(
     # tokens "mots" (avec frontière de mot pour ne pas rogner un nom de lieu : Vanves, Maison…)
     r"(?:imm[ée]diate?ment?|imm[ée]diat\w*|imediat\w*|immediat\w*|course\s+imm[ée]diate?|"
     r"r[ée]servation|resa|relance|dans\s+\d+\s*min\w*|heure|train\s+arriv\w*|à|"
+    r"ce\s+(?:soir|matin|midi)|cet\s+apr[èe]s[\s-]?midi|"
     r"aujourd['’]?hui|demain|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|"
     r"janvier|février|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|décembre|"
     r"van|break|mono|[ée]co|c(?=[0-9a-z]*\d)[0-9a-z]{5,})\b"  # dernier = codes course type C2JR1085403 (exige un chiffre : n'efface pas Courbevoie, Clichy…)
@@ -279,7 +280,33 @@ LEAD_JUNK = re.compile(
     r")+", re.I)
 
 # métadonnées (pax, bagages, distance) — jamais un lieu de départ
-META_RE = re.compile(r"\b(personnes?|passagers?|pax|km|bagages?|valises?)\b", re.I)
+META_RE = re.compile(
+    r"\b(personnes?|passagers?|pax|km|bagages?|valises?|r[ée]hausseurs?|si[èe]ges?|b[ée]b[ée]s?|enfants?)\b",
+    re.I)
+# Séparateur départ/arrivée dans une même ligne : « X pour Y », « X vers Y ».
+_TO_WORD = r"\b(?:pour|vers)\b"
+
+
+def geo_variants(c: str) -> list[str]:
+    """Formes à soumettre au géocodeur, de la plus précise à la plus simple.
+    Nominatim ne trouve pas « 75016(Trocadéro », « métro Oberkampf » ni « 75004 (côté quai) » :
+    on retire « métro », on aplatit les parenthèses et on garde le code postal seul en secours."""
+    out: list[str] = []
+
+    def add(x: str) -> None:
+        x = " ".join(x.split()).strip(_SYMBOLS + ".,-–—")
+        if x and x.lower() not in (o.lower() for o in out):
+            out.append(x)
+
+    s = re.sub(r"\b(?:m[ée]tro|station)\b\s*", "", c, flags=re.I)
+    if "(" in s:
+        add(re.sub(r"[()]", " ", s))
+        add(s.split("(")[0])
+    else:
+        add(s)
+    add(re.sub(r"^h[ôo]tel\s+", "", s, flags=re.I))   # « hôtel Aéroport d'Orly » -> « Aéroport d'Orly »
+    add(c)
+    return out
 
 
 def is_course(text: str) -> bool:
@@ -336,8 +363,8 @@ def extract_pickup(text: str) -> list[str]:
         if m and len(m.group(1).strip()) > 2:
             candidates.append(m.group(1).strip())
 
-    # 2) motif "X pour Y" -> départ = X (dernier bout avant "pour")
-    m = re.search(r"(.+?)\bpour\b", text, re.I)
+    # 2) motif "X pour Y" / "X vers Y" -> départ = X (dernier bout avant le mot)
+    m = re.search(r"(.+?)" + _TO_WORD, text, re.I)
     if m:
         candidates.append(re.split(r"/|\n", m.group(1))[-1])
 
@@ -347,12 +374,14 @@ def extract_pickup(text: str) -> list[str]:
     # nettoyage (statut de tête) + coupe "pour Y" + expansion raccourcis + filtre + dédup
     seen, out = set(), []
     for c in candidates:
-        c = re.split(r"\bpour\b", c, maxsplit=1)[0]      # garde le départ, coupe l'arrivée
+        c = re.split(_TO_WORD, c, maxsplit=1, flags=re.I)[0]   # garde le départ, coupe l'arrivée
         c = expand_shortcuts(_clean(c))
-        if c and _is_location(c) and c.lower() not in seen:
-            seen.add(c.lower())
-            out.append(c)
-    return out[:4]
+        if c and _is_location(c):
+            for g in geo_variants(c):                    # formes que Nominatim comprend
+                if g.lower() not in seen:
+                    seen.add(g.lower())
+                    out.append(g)
+    return out[:6]
 
 
 # ─────────── Réservations : rentabilité (€/km) plutôt que proximité ───────────
@@ -492,14 +521,18 @@ def extract_dropoff(text: str) -> "str | None":
         m = ARR_MARK.search(s.strip(_SYMBOLS))
         if m and len(m.group(1).strip()) > 2:
             return expand_shortcuts(_clean(m.group(1)))
-    m = re.search(r"\bpour\b(.+)", text, re.I)        # "X pour Y" -> arrivée = Y
+    m = re.search(_TO_WORD + r"(.+)", text, re.I)     # "X pour/vers Y" -> arrivée = Y
     if m:
-        right = expand_shortcuts(_clean(re.split(r"/|\n", m.group(1))[0]))
+        right = re.split(r"/|\n", m.group(1))[0]
+        # « 75004(côté quai) 30€ net » : on coupe au premier prix / km (sinon _is_location refuse)
+        right = re.split(r"\d{1,3}(?:[.,]\d+)?\s*(?:€|euros?|eur\b|net\b|pab\b|km\b)", right,
+                         maxsplit=1, flags=re.I)[0]
+        right = expand_shortcuts(_clean(right))
         if _is_location(right):
             return right
     locs = []                                         # positionnel : 2e lieu distinct
     for s in segs:
-        for part in re.split(r"\bpour\b", s):
+        for part in re.split(_TO_WORD, s, flags=re.I):
             c = expand_shortcuts(_clean(part))
             if c and _is_location(c) and c.lower() not in [x.lower() for x in locs]:
                 locs.append(c)
@@ -1113,13 +1146,22 @@ async def _resa_route(session, g1, g2, when_hour):
     return rt
 
 
-async def _resa_pickup_km(drv: DriverRT, session, dep: "str | None") -> "float | None":
+async def _geocode_any(session, cands: "list[str]") -> "tuple[float, float, str] | None":
+    """Premier candidat que le géocodeur sait placer (même logique que les courses immédiates)."""
+    for c in cands:
+        g = await geocode(session, c)
+        if g:
+            return g
+    return None
+
+
+async def _resa_pickup_km(drv: DriverRT, session, deps: "list[str]") -> "float | None":
     """Distance à vol d'oiseau entre la dernière position du chauffeur et le départ de la
     réservation. None si on ne sait pas (position périmée, départ introuvable)."""
     src = load_position(drv)
-    if src is None or not dep:
+    if src is None or not deps:
         return None
-    g = await geocode(session, dep)
+    g = await _geocode_any(session, deps)
     if not g:
         return None
     return D.haversine_km(src["lat"], src["lon"], g[0], g[1])
@@ -1140,7 +1182,7 @@ async def handle_reservation(drv: DriverRT, text: str, gid: int, mid: int) -> No
     async with aiohttp.ClientSession() as s:
         # Rayon (si le chauffeur en a réglé un) : filtre bon marché, avant tout routage.
         if drv.cfg("resa_radius_km"):
-            ok, why = D.accept_resa_radius(drv.p, pickup_km=await _resa_pickup_km(drv, s, dep))
+            ok, why = D.accept_resa_radius(drv.p, pickup_km=await _resa_pickup_km(drv, s, deps))
             if not ok:
                 log.info("%s Réservation ignorée : %s.", drv.tag, why)
                 return
@@ -1151,8 +1193,8 @@ async def handle_reservation(drv: DriverRT, text: str, gid: int, mid: int) -> No
             if not dep or not arr:
                 await escalate_raw(drv, text, load_position(drv), "réservation : trajet incomplet", gid, mid)
                 return
-            g1 = await geocode(s, dep)
-            g2 = await geocode(s, arr)
+            g1 = await _geocode_any(s, deps)         # tous les candidats, pas seulement le 1er
+            g2 = await _geocode_any(s, geo_variants(arr))
             if not g1 or not g2:
                 await escalate_raw(drv, text, load_position(drv), "réservation : géocodage trajet KO", gid, mid)
                 return
