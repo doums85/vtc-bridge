@@ -60,6 +60,29 @@ def test_settings() -> bool:
     return ok
 
 
+def test_env_defaults() -> bool:
+    """Les défauts du .env doivent être lus MÊME si drivers est importé avant tout
+    load_dotenv() (cas de vtc_bridge.py et add_driver.py). Régression : le seuil restait à
+    8 min quel que soit THRESHOLD_SECONDS, et les courses immédiates n'arrivaient plus."""
+    import shutil
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copy(os.path.join(here, "drivers.py"), d)
+        with open(os.path.join(d, ".env"), "w") as f:
+            f.write("THRESHOLD_SECONDS=900\nEURKM_MIN=1.1\n")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("THRESHOLD_SECONDS", "EURKM_MIN")}
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import drivers as D; p = D.Profile(id=1); "
+             "print(p.get('threshold_min'), p.get('eurkm_min'))"],
+            cwd=d, env=env, capture_output=True, text=True)
+        got = out.stdout.split()
+    ok = check(".env lu à l'import (seuil 900 s -> 15 min, €/km 1.1)", got, ["15", "1.1"])
+    return ok
+
+
 def test_rules() -> bool:
     ok = True
     p = D.Profile(id=1)
@@ -172,7 +195,7 @@ def test_migration() -> bool:
 
 def main() -> int:
     ok = True
-    for fn in (test_settings, test_rules, test_isolation, test_migration):
+    for fn in (test_settings, test_env_defaults, test_rules, test_isolation, test_migration):
         print(f"\n— {fn.__name__}")
         ok &= fn()
     print("\nTout passe." if ok else "\nDes tests échouent.")
