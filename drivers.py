@@ -15,6 +15,15 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from dotenv import load_dotenv
+
+# Les défauts ci-dessous sont lus dans l'environnement DÈS L'IMPORT de ce module. Les
+# points d'entrée (vtc_bridge.py, add_driver.py) importent `drivers` AVANT leur propre
+# load_dotenv() : sans cet appel, le .env du serveur est ignoré et chaque seuil retombe
+# sur la valeur codée en dur (THRESHOLD_SECONDS -> 8 min). Sans effet sur les variables
+# déjà définies (Infisical, systemd), qui restent prioritaires.
+load_dotenv()
+
 
 # ───────────────────────── Réglages modifiables ─────────────────────────
 # Valeurs par défaut : celles du .env d'origine, pour qu'un chauffeur qui n'a rien
