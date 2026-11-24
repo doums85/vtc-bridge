@@ -80,7 +80,7 @@ class Ev:
         self.responses.append((text, buttons))
 
 
-async def fake_geocode(session, query):
+async def fake_geocode(session, query, priority=0):
     q = query.lower()
     if "gare de lyon" in q or "75012" in q:
         return (*GARE_DE_LYON, "Gare de Lyon, 75012 Paris")

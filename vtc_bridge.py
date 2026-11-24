@@ -35,6 +35,8 @@ import io
 import time
 import unicodedata
 import asyncio
+import heapq
+import itertools
 import logging
 
 import aiohttp
@@ -547,8 +549,64 @@ _GEO_CACHE: dict[str, tuple[float, "tuple[float, float, str] | None"]] = {}
 _GEO_TTL_HIT = 6 * 3600           # une adresse trouvée ne bouge pas
 _GEO_TTL_MISS = 600               # un « introuvable » se retente au bout de 10 min
 _GEO_MAX = 4000
-_GEO_LOCK = asyncio.Lock()
+_GEO_MIN_INTERVAL = 1.1             # secondes entre deux requêtes Nominatim (politique d'usage : 1/s)
 _geo_last = 0.0
+
+# Priorité d'accès au géocodeur. Une course immédiate se joue en secondes ; une réservation
+# reste valable des heures. Un pic de réservations (plusieurs géocodages chacune, à raison
+# d'une requête par seconde pour tout le service) ne doit donc jamais faire attendre une
+# immédiate derrière lui : au pire, elle attend la requête déjà en cours.
+GEO_URGENT = 0      # course immédiate : départ, puis destination
+GEO_BATCH = 1       # réservation : peut patienter
+
+
+class _PriorityLock:
+    """Verrou asyncio où l'on passe devant les autres selon une priorité (plus petit = plus
+    urgent), puis par ordre d'arrivée à priorité égale. Ne préempte jamais le détenteur."""
+
+    def __init__(self) -> None:
+        self._locked = False
+        self._waiters: list = []                 # tas de (priorité, n° d'arrivée, future)
+        self._seq = itertools.count()
+
+    async def acquire(self, priority: int) -> None:
+        if not self._locked and not self._waiters:
+            self._locked = True
+            return
+        fut = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._waiters, (priority, next(self._seq), fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():   # le verrou nous avait déjà été passé
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            _, _, fut = heapq.heappop(self._waiters)
+            if not fut.done():                   # on saute les attentes annulées
+                fut.set_result(None)             # transfert direct : le verrou reste pris
+                return
+        self._locked = False
+
+    def hold(self, priority: int) -> "_LockCtx":
+        """`async with lock.hold(priority): ...`"""
+        return _LockCtx(self, priority)
+
+
+class _LockCtx:
+    def __init__(self, lock: _PriorityLock, priority: int) -> None:
+        self._lock, self._priority = lock, priority
+
+    async def __aenter__(self) -> None:
+        await self._lock.acquire(self._priority)
+
+    async def __aexit__(self, *exc) -> None:
+        self._lock.release()
+
+
+_GEO_LOCK = _PriorityLock()
 
 
 def _geo_cached(key: str):
@@ -562,17 +620,18 @@ def _geo_cached(key: str):
     return True, val
 
 
-async def geocode(session: aiohttp.ClientSession, query: str) -> tuple[float, float, str] | None:
+async def geocode(session: aiohttp.ClientSession, query: str,
+                  priority: int = GEO_URGENT) -> tuple[float, float, str] | None:
     global _geo_last
     key = " ".join(query.lower().split())
     found, val = _geo_cached(key)
     if found:
         return val
-    async with _GEO_LOCK:
+    async with _GEO_LOCK.hold(priority):
         found, val = _geo_cached(key)              # un autre chauffeur l'a peut-être résolu entre-temps
         if found:
             return val
-        wait = 1.1 - (time.monotonic() - _geo_last)
+        wait = _GEO_MIN_INTERVAL - (time.monotonic() - _geo_last)
         if wait > 0:
             await asyncio.sleep(wait)
         params = {"q": query, "format": "jsonv2", "limit": "1", "addressdetails": "0"}
@@ -1146,10 +1205,11 @@ async def _resa_route(session, g1, g2, when_hour):
     return rt
 
 
-async def _geocode_any(session, cands: "list[str]") -> "tuple[float, float, str] | None":
+async def _geocode_any(session, cands: "list[str]",
+                       priority: int = GEO_URGENT) -> "tuple[float, float, str] | None":
     """Premier candidat que le géocodeur sait placer (même logique que les courses immédiates)."""
     for c in cands:
-        g = await geocode(session, c)
+        g = await geocode(session, c, priority)
         if g:
             return g
     return None
@@ -1161,7 +1221,7 @@ async def _resa_pickup_km(drv: DriverRT, session, deps: "list[str]") -> "float |
     src = load_position(drv)
     if src is None or not deps:
         return None
-    g = await _geocode_any(session, deps)
+    g = await _geocode_any(session, deps, GEO_BATCH)
     if not g:
         return None
     return D.haversine_km(src["lat"], src["lon"], g[0], g[1])
@@ -1193,8 +1253,8 @@ async def handle_reservation(drv: DriverRT, text: str, gid: int, mid: int) -> No
             if not dep or not arr:
                 await escalate_raw(drv, text, load_position(drv), "réservation : trajet incomplet", gid, mid)
                 return
-            g1 = await _geocode_any(s, deps)         # tous les candidats, pas seulement le 1er
-            g2 = await _geocode_any(s, geo_variants(arr))
+            g1 = await _geocode_any(s, deps, GEO_BATCH)  # tous les candidats, pas seulement le 1er
+            g2 = await _geocode_any(s, geo_variants(arr), GEO_BATCH)
             if not g1 or not g2:
                 await escalate_raw(drv, text, load_position(drv), "réservation : géocodage trajet KO", gid, mid)
                 return
